@@ -22,8 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Globalization::{
+    CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar, WideCharToMultiByte,
+};
 use windows::Win32::Networking::WinHttp::*;
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{HSTRING, PCSTR, PCWSTR};
 
 use super::error::{map_windows_error, map_winhttp_error};
 
@@ -566,10 +569,7 @@ fn request_headers(
     for (name, value) in &merged {
         block.extend(name.as_str().encode_utf16());
         block.extend(": ".encode_utf16());
-        // WinHTTP narrows header text to one byte per code unit, so widening
-        // each byte to the code unit of the same value sends non-ASCII values
-        // (UTF-8 or otherwise) unchanged.
-        block.extend(value.as_bytes().iter().map(|&byte| u16::from(byte)));
+        block.extend(widen_header_text(value.as_bytes()));
         block.extend("\r\n".encode_utf16());
     }
     block
@@ -630,7 +630,7 @@ fn query_response_headers(handle: *mut c_void) -> Result<HeaderMap> {
             continue;
         };
         let name = String::from_utf16_lossy(&line[..colon]);
-        let value = header_bytes(&line[colon + 1..]);
+        let value = narrow_header_text(&line[colon + 1..]);
         if let (Ok(name), Ok(value)) = (
             http::HeaderName::from_bytes(name.trim().as_bytes()),
             HeaderValue::from_bytes(value.trim_ascii()),
@@ -641,20 +641,43 @@ fn query_response_headers(handle: *mut c_void) -> Result<HeaderMap> {
     Ok(headers)
 }
 
-/// Undo WinHTTP's widening of response header bytes: code units up to 0xFF
-/// are the original bytes; anything wider is kept as UTF-8.
-fn header_bytes(units: &[u16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(units.len());
-    for c in char::decode_utf16(units.iter().copied()) {
-        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
-        if let Ok(byte) = u8::try_from(u32::from(c)) {
-            bytes.push(byte);
-        } else {
-            let mut utf8 = [0u8; 4];
-            bytes.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+// WinHTTP converts header text between bytes and UTF-16 with the ANSI code
+// page. Converting with the same code page in the other direction keeps the
+// bytes the caller set or the server sent; bytes the code page cannot
+// represent cannot survive WinHTTP either way.
+
+fn widen_header_text(bytes: &[u8]) -> Vec<u16> {
+    if bytes.is_ascii() {
+        return bytes.iter().map(|&byte| u16::from(byte)).collect();
+    }
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+    let len = unsafe { MultiByteToWideChar(CP_ACP, flags, bytes, None) };
+    if len > 0 {
+        let mut wide = vec![0u16; len as usize];
+        let written = unsafe { MultiByteToWideChar(CP_ACP, flags, bytes, Some(&mut wide)) };
+        if written > 0 {
+            wide.truncate(written as usize);
+            return wide;
         }
     }
-    bytes
+    bytes.iter().map(|&byte| u16::from(byte)).collect()
+}
+
+fn narrow_header_text(units: &[u16]) -> Vec<u8> {
+    if units.iter().all(|&unit| unit < 0x80) {
+        return units.iter().map(|&unit| unit as u8).collect();
+    }
+    let len = unsafe { WideCharToMultiByte(CP_ACP, 0, units, None, PCSTR::null(), None) };
+    if len > 0 {
+        let mut bytes = vec![0u8; len as usize];
+        let written =
+            unsafe { WideCharToMultiByte(CP_ACP, 0, units, Some(&mut bytes), PCSTR::null(), None) };
+        if written > 0 {
+            bytes.truncate(written as usize);
+            return bytes;
+        }
+    }
+    String::from_utf16_lossy(units).into_bytes()
 }
 
 /// The URL the response came from, after redirects.
