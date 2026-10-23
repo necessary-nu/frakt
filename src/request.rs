@@ -51,7 +51,7 @@ impl Request {
 
         // Check for HTTP error status if enabled (default is true)
         if error_for_status && response.status().as_u16() >= 400 {
-            return Err(crate::Error::HttpError(response));
+            return Err(crate::Error::HttpError(Box::new(response)));
         }
 
         Ok(response)

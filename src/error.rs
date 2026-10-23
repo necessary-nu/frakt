@@ -125,7 +125,7 @@ pub enum Error {
     /// # }
     /// ```
     #[error("HTTP error: {}", .0.status())]
-    HttpError(crate::Response),
+    HttpError(Box<crate::Response>),
 
     /// WebSocket connection was closed.
     ///

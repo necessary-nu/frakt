@@ -412,7 +412,7 @@ impl DownloadBuilder {
 
         // Check for HTTP error status if enabled
         if error_for_status && status.as_u16() >= 400 {
-            return Err(crate::Error::HttpError(response));
+            return Err(crate::Error::HttpError(Box::new(response)));
         }
 
         // Get content length for progress callback before consuming response
