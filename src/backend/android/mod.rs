@@ -409,7 +409,7 @@ pub fn test_dns(hostname: &str) -> Result<String> {
 pub struct AndroidBackend {
     pub(crate) jvm: &'static JavaVM,
     cronet_engine: Arc<GlobalRef>,
-    cookie_storage: Option<Arc<crate::backend::CookieStoreImpl>>,
+    cookie_storage: Option<Arc<crate::backend::CookieJar>>,
     config: BackendConfig,
 }
 
@@ -434,7 +434,7 @@ impl AndroidBackend {
 
         // Create cookie storage if cookies are enabled
         let cookie_storage = if config.use_cookies.unwrap_or(false) {
-            Some(Arc::new(crate::backend::CookieStoreImpl::new()))
+            Some(Arc::new(crate::backend::CookieJar::new()))
         } else {
             None
         };

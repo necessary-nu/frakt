@@ -22,7 +22,7 @@ pub struct WindowsBackend {
     /// Optional cookie jar for this backend
     cookie_jar: Option<crate::CookieJar>,
     /// Cookie storage using cookie_store
-    cookie_storage: Option<std::sync::Arc<crate::backend::CookieStoreImpl>>,
+    cookie_storage: Option<std::sync::Arc<crate::backend::CookieJar>>,
     /// Default headers to add to all requests
     default_headers: Option<http::HeaderMap>,
     /// Request timeout
@@ -56,7 +56,7 @@ impl WindowsBackend {
 
         // Create cookie storage if cookies are enabled
         let cookie_storage = if config.use_cookies.unwrap_or(false) {
-            Some(std::sync::Arc::new(crate::backend::CookieStoreImpl::new()))
+            Some(std::sync::Arc::new(crate::backend::CookieJar::new()))
         } else {
             None
         };

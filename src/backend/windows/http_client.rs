@@ -69,7 +69,7 @@ type AsyncResult = Result<()>;
 /// Context data passed to WinHTTP callback for cookie handling, progress tracking, and async signaling
 #[repr(C)]
 struct CallbackContext {
-    cookie_storage: Option<std::sync::Arc<crate::backend::CookieStoreImpl>>,
+    cookie_storage: Option<std::sync::Arc<crate::backend::CookieJar>>,
     request_url: url::Url,
     progress_callback: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
     total_body_size: u64,
@@ -417,7 +417,7 @@ pub async fn execute_winhttp_request(
     user_agent: &str,
     default_headers: &Option<http::HeaderMap>,
     timeout: &Option<Duration>,
-    cookie_storage: &Option<std::sync::Arc<crate::backend::CookieStoreImpl>>,
+    cookie_storage: &Option<std::sync::Arc<crate::backend::CookieJar>>,
 ) -> Result<BackendResponse> {
     let url = request.url;
     let method = request.method;
@@ -504,7 +504,7 @@ async fn execute_async_winhttp(
     body_bytes: &[u8],
     body_content_type: Option<&str>,
     timeout: Option<&Duration>,
-    cookie_storage: &Option<std::sync::Arc<crate::backend::CookieStoreImpl>>,
+    cookie_storage: &Option<std::sync::Arc<crate::backend::CookieJar>>,
     progress_callback: &Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
 ) -> Result<BackendResponse> {
     // Build headers string
@@ -929,7 +929,7 @@ fn parse_headers_into_map(header_string: &str, headers: &mut http::HeaderMap) {
 fn store_cookies_from_headers(
     header_string: &str,
     url: &url::Url,
-    cookie_storage: &std::sync::Arc<crate::backend::CookieStoreImpl>,
+    cookie_storage: &std::sync::Arc<crate::backend::CookieJar>,
 ) {
     // Convert the header string into an http::HeaderMap to use with cookie_store
     let mut headers = http::HeaderMap::new();
