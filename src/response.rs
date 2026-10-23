@@ -35,15 +35,23 @@ impl Response {
     ///
     /// `deadline` is the request's total deadline, if it has one; reading the
     /// body past it fails with [`Error::Timeout`] and cancels the transfer.
+    /// `head_request` says whether the request was HEAD, whose responses
+    /// have no body whatever their Content-Length.
     pub(crate) fn from_backend(
         backend_response: BackendResponse,
         deadline: Option<Instant>,
+        head_request: bool,
     ) -> Self {
+        let expected_len = if head_request {
+            None
+        } else {
+            expected_body_len(backend_response.status, &backend_response.headers)
+        };
         Self {
             status: backend_response.status,
             headers: backend_response.headers,
             url: backend_response.url,
-            body: ResponseBody::new(backend_response.body, deadline),
+            body: ResponseBody::new(backend_response.body, deadline, expected_len),
         }
     }
 
@@ -117,10 +125,41 @@ impl Response {
     }
 }
 
+/// The body length a response promises, when the bytes delivered must match
+/// it: an identity body with a Content-Length.
+fn expected_body_len(status: StatusCode, headers: &HeaderMap) -> Option<u64> {
+    if status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+    {
+        return None;
+    }
+    let encoded = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"));
+    if encoded {
+        return None;
+    }
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// A backend body plus the request's total deadline.
+///
+/// It also checks the body against Content-Length, so that a connection
+/// that closes early is an error even on a stack that reports it as a clean
+/// end.
 struct ResponseBody {
     stream: Option<BodyStream>,
     deadline: Option<Pin<Box<Sleep>>>,
+    expected_len: Option<u64>,
+    received: u64,
 }
 
 // SAFETY: every method takes `&mut self`, so a shared reference gives no
@@ -129,10 +168,12 @@ struct ResponseBody {
 unsafe impl Sync for ResponseBody {}
 
 impl ResponseBody {
-    fn new(stream: BodyStream, deadline: Option<Instant>) -> Self {
+    fn new(stream: BodyStream, deadline: Option<Instant>, expected_len: Option<u64>) -> Self {
         Self {
             stream: Some(stream),
             deadline: deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+            expected_len,
+            received: 0,
         }
     }
 
@@ -154,14 +195,28 @@ impl ResponseBody {
         }
 
         match stream.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.received += chunk.len() as u64;
+                Poll::Ready(Some(Ok(chunk)))
+            }
             Poll::Ready(Some(Err(error))) => {
                 self.stream = None;
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
                 self.stream = None;
-                Poll::Ready(None)
+                match self.expected_len {
+                    Some(expected) if self.received < expected => {
+                        Poll::Ready(Some(Err(Error::Network {
+                            code: -1,
+                            message: format!(
+                                "Connection closed after {} of {} body bytes",
+                                self.received, expected
+                            ),
+                        })))
+                    }
+                    _ => Poll::Ready(None),
+                }
             }
             Poll::Pending => Poll::Pending,
         }
@@ -243,5 +298,54 @@ impl tokio::io::AsyncRead for ResponseStream {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(status: u16, headers: &[(&str, &str)], chunks: &[&'static [u8]]) -> Response {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let chunks: Vec<Result<Bytes>> = chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();
+        Response::from_backend(
+            BackendResponse {
+                status: StatusCode::from_u16(status).unwrap(),
+                headers: map,
+                url: Url::parse("http://example.invalid/").unwrap(),
+                body: Box::pin(futures_util::stream::iter(chunks)),
+                redirect_headers: vec![],
+            },
+            None,
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn short_identity_body_is_an_error() {
+        let result = response(200, &[("content-length", "10")], &[b"hello"])
+            .bytes()
+            .await;
+        assert!(matches!(result, Err(Error::Network { .. })), "{:?}", result);
+    }
+
+    #[tokio::test]
+    async fn complete_or_unchecked_bodies_end_cleanly() {
+        let full = response(200, &[("content-length", "5")], &[b"he", b"llo"]);
+        assert_eq!(full.bytes().await.unwrap(), "hello");
+        let encoded = response(
+            200,
+            &[("content-length", "10"), ("content-encoding", "gzip")],
+            &[b"hello"],
+        );
+        assert_eq!(encoded.bytes().await.unwrap(), "hello");
+        let not_modified = response(304, &[("content-length", "10")], &[]);
+        assert!(not_modified.bytes().await.unwrap().is_empty());
     }
 }

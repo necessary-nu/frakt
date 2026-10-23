@@ -25,6 +25,7 @@ impl Request {
     /// Send the request and get a response
     pub async fn send(self) -> Result<crate::Response> {
         let error_for_status = self.error_for_status;
+        let head_request = self.method == http::Method::HEAD;
         let deadline = self
             .timeout
             .or(self.backend.total_timeout())
@@ -46,7 +47,7 @@ impl Request {
                 .map_err(|_| crate::Error::Timeout)??,
             None => execute.await?,
         };
-        let response = crate::Response::from_backend(backend_response, deadline);
+        let response = crate::Response::from_backend(backend_response, deadline, head_request);
 
         // Check for HTTP error status if enabled (default is true)
         if error_for_status && response.status().as_u16() >= 400 {
