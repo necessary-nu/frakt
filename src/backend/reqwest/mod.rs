@@ -9,12 +9,13 @@ use crate::backend::types::{BackendRequest, BackendResponse, ProgressCallback};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::Stream;
-use futures_util::StreamExt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::time::Sleep;
 use url::Url;
 
 /// A stream that tracks upload progress as data is consumed
@@ -70,33 +71,88 @@ impl Stream for ProgressTrackingStream {
     }
 }
 
+/// A reqwest body polled directly by the consumer, so hyper reads from the
+/// socket only as fast as the consumer reads and dropping it closes the
+/// connection.
+struct ReqwestBody {
+    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    read_timeout: Option<Duration>,
+    /// Armed only while the consumer is waiting on the network.
+    idle: Option<Pin<Box<Sleep>>>,
+    done: bool,
+}
+
+impl Stream for ReqwestBody {
+    type Item = Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.idle = None;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.done = true;
+                Poll::Ready(Some(Err(map_reqwest_error(error))))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                let Some(timeout) = self.read_timeout else {
+                    return Poll::Pending;
+                };
+                let idle = self
+                    .idle
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+                if idle.as_mut().poll(cx).is_ready() {
+                    self.done = true;
+                    return Poll::Ready(Some(Err(Error::Timeout)));
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+fn map_reqwest_error(error: reqwest::Error) -> Error {
+    if error.is_timeout() {
+        Error::Timeout
+    } else {
+        Error::Network {
+            code: -1,
+            message: format!("Request failed: {}", error),
+        }
+    }
+}
+
 /// Reqwest backend for cross-platform HTTP
 #[derive(Clone)]
 pub struct ReqwestBackend {
     client: reqwest::Client,
     cookie_jar: Option<crate::CookieJar>,
+    read_timeout: Option<Duration>,
+    total_timeout: Option<Duration>,
 }
 
 impl ReqwestBackend {
     /// Create a new Reqwest backend
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| Error::Internal(format!("Failed to create reqwest client: {}", e)))?;
-
-        Ok(Self {
-            client,
-            cookie_jar: None,
-        })
+        Self::with_config(crate::backend::BackendConfig::default())
     }
 
     /// Create a new Reqwest backend with configuration
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder();
 
-        // Apply timeout configuration
-        if let Some(timeout) = config.timeout {
-            builder = builder.timeout(timeout);
+        // reqwest's own `timeout` is a total deadline and its `read_timeout`
+        // cannot be overridden per request, so both are enforced here instead.
+        if let Some(timeout) = config.connect_timeout {
+            builder = builder.connect_timeout(timeout);
         }
 
         // Apply user agent configuration
@@ -181,7 +237,13 @@ impl ReqwestBackend {
         Ok(Self {
             client,
             cookie_jar: config.cookie_jar,
+            read_timeout: config.read_timeout,
+            total_timeout: config.timeout,
         })
+    }
+
+    pub(crate) fn total_timeout(&self) -> Option<Duration> {
+        self.total_timeout
     }
 
     /// Execute an HTTP request using reqwest
@@ -194,24 +256,9 @@ impl ReqwestBackend {
             }
         }
 
-        // Convert method
-        let method = match request.method {
-            http::Method::GET => reqwest::Method::GET,
-            http::Method::POST => reqwest::Method::POST,
-            http::Method::PUT => reqwest::Method::PUT,
-            http::Method::DELETE => reqwest::Method::DELETE,
-            http::Method::HEAD => reqwest::Method::HEAD,
-            http::Method::PATCH => reqwest::Method::PATCH,
-            _ => {
-                return Err(Error::Internal(format!(
-                    "Unsupported method: {}",
-                    request.method
-                )));
-            }
-        };
-
         // Build request
-        let mut req_builder = self.client.request(method, request.url.clone());
+        let read_timeout = request.read_timeout.or(self.read_timeout);
+        let mut req_builder = self.client.request(request.method, request.url);
 
         // Add headers
         for (name, value) in &request.headers {
@@ -268,63 +315,25 @@ impl ReqwestBackend {
             }
         }
 
-        // Send request
-        let response = req_builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                Error::Timeout
-            } else {
-                Error::Network {
-                    code: -1,
-                    message: format!("Request failed: {}", e),
-                }
-            }
-        })?;
-
-        // Extract status and headers
-        let status = response.status();
-        let headers = response.headers().clone();
-
-        // Convert headers to http::HeaderMap
-        let mut header_map = http::HeaderMap::new();
-        for (name, value) in headers.iter() {
-            if let Ok(header_name) = http::HeaderName::from_bytes(name.as_str().as_bytes()) {
-                if let Ok(header_value) = http::HeaderValue::from_bytes(value.as_bytes()) {
-                    header_map.insert(header_name, header_value);
-                }
-            }
+        let send = req_builder.send();
+        let response = match read_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send)
+                .await
+                .map_err(|_| Error::Timeout)?,
+            None => send.await,
         }
-
-        // Create channel for streaming body
-        let (tx, rx) = mpsc::channel(32);
-
-        // Stream response body
-        tokio::spawn(async move {
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        if tx.send(Ok(bytes::Bytes::from(bytes))).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Error::Network {
-                                code: -1,
-                                message: format!("Stream error: {}", e),
-                            }))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        });
+        .map_err(map_reqwest_error)?;
 
         Ok(BackendResponse {
-            status,
-            headers: header_map,
-            url: request.url,
-            body_receiver: rx,
+            status: response.status(),
+            headers: response.headers().clone(),
+            url: response.url().clone(),
+            body: Box::pin(ReqwestBody {
+                inner: Box::pin(response.bytes_stream()),
+                read_timeout,
+                idle: None,
+                done: false,
+            }),
             redirect_headers: vec![],
         })
     }

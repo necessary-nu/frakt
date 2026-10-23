@@ -629,9 +629,28 @@ impl ClientBuilder {
         }
     }
 
-    /// Set request timeout
+    /// Set a total deadline for every request, from sending it to reading the
+    /// last byte of the body. Off by default; it would cut off large
+    /// downloads. See [`BackendConfig`](crate::backend::BackendConfig) for how
+    /// the timeouts relate.
     pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
         self.config.timeout = Some(timeout);
+        self
+    }
+
+    /// Set the connect timeout (default 30 seconds). See
+    /// [`BackendConfig`](crate::backend::BackendConfig) for which backends can
+    /// enforce it separately.
+    pub fn connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the read (idle) timeout (default 60 seconds): how long a transfer
+    /// may wait on the network for the response to start or for the next
+    /// chunk of the body. Time the consumer spends not reading does not count.
+    pub fn read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.read_timeout = Some(timeout);
         self
     }
 

@@ -1,6 +1,7 @@
 //! Request types and builders with backend abstraction
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::backend::{Backend, types::BackendRequest};
 use crate::{Result, body::Body};
@@ -16,23 +17,36 @@ pub struct Request {
     pub(crate) backend: Backend,
     pub(crate) progress_callback: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
     pub(crate) error_for_status: bool,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
 }
 
 impl Request {
     /// Send the request and get a response
     pub async fn send(self) -> Result<crate::Response> {
         let error_for_status = self.error_for_status;
+        let deadline = self
+            .timeout
+            .or(self.backend.total_timeout())
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         let backend_request = BackendRequest {
             method: self.method,
             url: self.url,
             headers: self.headers,
             body: self.body,
             progress_callback: self.progress_callback,
-            timeout: None, // Timeout is applied from backend config
+            read_timeout: self.read_timeout,
         };
 
-        let backend_response = self.backend.execute(backend_request).await?;
-        let response = crate::Response::from_backend(backend_response);
+        // Dropping the backend future on timeout cancels the transfer.
+        let execute = self.backend.execute(backend_request);
+        let backend_response = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, execute)
+                .await
+                .map_err(|_| crate::Error::Timeout)??,
+            None => execute.await?,
+        };
+        let response = crate::Response::from_backend(backend_response, deadline);
 
         // Check for HTTP error status if enabled (default is true)
         if error_for_status && response.status().as_u16() >= 400 {
@@ -52,6 +66,8 @@ pub struct RequestBuilder {
     backend: Backend,
     progress_callback: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
     error_for_status: bool,
+    timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
 }
 
 impl RequestBuilder {
@@ -64,6 +80,8 @@ impl RequestBuilder {
             backend,
             progress_callback: None,
             error_for_status: true,
+            timeout: None,
+            read_timeout: None,
         }
     }
 
@@ -124,6 +142,27 @@ impl RequestBuilder {
         F: Fn(u64, Option<u64>) + Send + Sync + 'static,
     {
         self.progress_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Set a total deadline for this request, overriding the client's.
+    ///
+    /// The deadline covers everything from sending the request to reading the
+    /// last byte of the body; when it passes, the transfer is cancelled and
+    /// the pending call fails with [`Error::Timeout`](crate::Error::Timeout).
+    /// Use it for small requests, not for large downloads.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set the read (idle) timeout for this request, overriding the client's.
+    ///
+    /// This bounds how long the transfer may wait for the network while frakt
+    /// wants data: for the response to start and, during the body, for the
+    /// next chunk. Time the consumer spends not reading does not count.
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
         self
     }
 
@@ -196,6 +235,8 @@ impl RequestBuilder {
             backend: self.backend,
             progress_callback: self.progress_callback,
             error_for_status: self.error_for_status,
+            timeout: self.timeout,
+            read_timeout: self.read_timeout,
         };
         request.send().await
     }

@@ -68,7 +68,7 @@ mod tests {
                     status: http::StatusCode::OK,
                     headers: HeaderMap::new(),
                     url: url.clone(),
-                    body_receiver: receiver,
+                    body: crate::backend::types::channel_body(receiver),
                     redirect_headers: vec![],
                 })
             }

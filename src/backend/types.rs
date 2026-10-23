@@ -1,8 +1,16 @@
 //! Shared types between backend implementations
 
 use crate::body::Body;
+use bytes::Bytes;
+use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -18,9 +26,18 @@ pub struct BackendRequest {
     pub body: Option<Body>,
     /// Optional progress callback for uploads
     pub progress_callback: Option<ProgressCallback>,
-    /// Optional timeout for the request
-    pub timeout: Option<Duration>,
+    /// Per-request override of the backend's read (idle) timeout: the longest
+    /// the transfer may wait for the network while frakt wants data.
+    pub read_timeout: Option<Duration>,
 }
+
+/// A response body as a stream of chunks.
+///
+/// The stream ends with `None` only after the whole body arrived; a transfer
+/// that fails part-way yields `Some(Err(_))`. Dropping the stream before the
+/// end must cancel the transfer and release everything the backend holds for
+/// it.
+pub type BodyStream = Pin<Box<dyn Stream<Item = crate::Result<Bytes>> + Send + 'static>>;
 
 /// Platform-agnostic HTTP response
 pub struct BackendResponse {
@@ -28,12 +45,30 @@ pub struct BackendResponse {
     pub status: StatusCode,
     /// Response headers
     pub headers: HeaderMap,
-    /// The URL that was requested
+    /// The final URL, after any redirects
     pub url: Url,
-    /// Stream of response body bytes
-    pub body_receiver: mpsc::Receiver<Result<bytes::Bytes, crate::Error>>,
+    /// The response body
+    pub body: BodyStream,
     /// Headers from redirect responses (for cookie processing)
     pub redirect_headers: Vec<HeaderMap>,
+}
+
+/// Wrap the receiving end of a body channel as a [`BodyStream`].
+///
+/// Dropping the stream drops the receiver, which the sending side observes as
+/// a failed send.
+pub fn channel_body(receiver: mpsc::Receiver<crate::Result<Bytes>>) -> BodyStream {
+    struct ChannelBody(mpsc::Receiver<crate::Result<Bytes>>);
+
+    impl Stream for ChannelBody {
+        type Item = crate::Result<Bytes>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    Box::pin(ChannelBody(receiver))
 }
 
 /// Platform-agnostic download handle

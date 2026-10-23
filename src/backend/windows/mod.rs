@@ -25,8 +25,10 @@ pub struct WindowsBackend {
     cookie_storage: Option<std::sync::Arc<crate::backend::CookieJar>>,
     /// Default headers to add to all requests
     default_headers: Option<http::HeaderMap>,
-    /// Request timeout
+    /// Read (idle) timeout
     timeout: Option<Duration>,
+    /// Total deadline per request
+    total_timeout: Option<Duration>,
     /// BITS download manager for background downloads
     bits_manager: Option<std::sync::Arc<BitsDownloadManager>>,
 }
@@ -43,6 +45,7 @@ impl WindowsBackend {
             cookie_storage: None,
             default_headers: None,
             timeout: None,
+            total_timeout: None,
             bits_manager,
         })
     }
@@ -66,7 +69,8 @@ impl WindowsBackend {
             cookie_jar: config.cookie_jar,
             cookie_storage,
             default_headers: config.default_headers,
-            timeout: config.timeout,
+            timeout: config.read_timeout,
+            total_timeout: config.timeout,
             bits_manager,
         })
     }
@@ -121,7 +125,7 @@ impl WindowsBackend {
                 std::sync::Arc::new(cb)
                     as std::sync::Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>
             }),
-            timeout: self.timeout,
+            read_timeout: None,
         };
 
         let response = self.execute(request).await?;
@@ -134,10 +138,10 @@ impl WindowsBackend {
             .await
             .map_err(|e| Error::Internal(format!("Failed to create file: {}", e)))?;
 
-        let mut receiver = response.body_receiver;
+        let mut body = response.body;
         let mut bytes_downloaded = 0u64;
 
-        while let Some(chunk_result) = receiver.recv().await {
+        while let Some(chunk_result) = futures_util::StreamExt::next(&mut body).await {
             let chunk = chunk_result?;
             bytes_downloaded += chunk.len() as u64;
 
@@ -152,6 +156,10 @@ impl WindowsBackend {
             status,
             headers,
         })
+    }
+
+    pub(crate) fn total_timeout(&self) -> Option<Duration> {
+        self.total_timeout
     }
 
     /// Get the cookie jar if configured

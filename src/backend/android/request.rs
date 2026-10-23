@@ -44,7 +44,7 @@ pub async fn execute_request(
 
     // Save the URL and timeout before moving request
     let url = request.url.clone();
-    let timeout = request.timeout;
+    let timeout = request.read_timeout;
 
     // Build and start request - each function creates its own env
     println!("🚀 Building and starting request to: {}", url);
@@ -197,7 +197,7 @@ pub async fn execute_request(
         status,
         headers,
         url,
-        body_receiver,
+        body: crate::backend::types::channel_body(body_receiver),
         redirect_headers,
     })
 }

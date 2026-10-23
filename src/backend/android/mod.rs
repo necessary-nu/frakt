@@ -537,9 +537,8 @@ impl AndroidBackend {
             }
         }
 
-        // Apply timeout from config if not already set in request
-        if request.timeout.is_none() {
-            request.timeout = self.config.timeout;
+        if request.read_timeout.is_none() {
+            request.read_timeout = self.config.read_timeout;
         }
 
         // Apply default headers from config (don't override existing headers)
@@ -592,6 +591,10 @@ impl AndroidBackend {
             progress_callback,
         )
         .await
+    }
+
+    pub(crate) fn total_timeout(&self) -> Option<std::time::Duration> {
+        self.config.timeout
     }
 
     /// Get the cookie jar if configured (not implemented for Android)

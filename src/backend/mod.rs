@@ -32,11 +32,43 @@ fn no_backend_error() -> Error {
     Error::Internal("No HTTP backend is enabled for this target".to_string())
 }
 
+/// Default for [`BackendConfig::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default for [`BackendConfig::read_timeout`].
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Configuration for backend creation
-#[derive(Clone, Debug, Default)]
+///
+/// Timeouts mean the same thing on every backend:
+///
+/// - `connect_timeout` bounds name resolution plus connection setup where the
+///   platform stack exposes that phase (reqwest, WinHTTP). Foundation and
+///   Cronet do not, so there `read_timeout` bounds the wait for the response
+///   to start instead.
+/// - `read_timeout` bounds how long a transfer may wait on the network while
+///   frakt wants data: for the response to start, and then for each next
+///   chunk of the body. Time spent waiting for the consumer to read does not
+///   count, so a slow consumer never trips it.
+/// - `timeout` is a total deadline from sending the request to reading the
+///   last byte of the body. It is off by default because it would cut off
+///   large downloads.
+///
+/// The default headers contain `Accept-Encoding: identity`, so bodies arrive
+/// exactly as the server stored them and `Content-Length`/`Content-Range`
+/// describe the bytes delivered. Foundation and Cronet otherwise ask for
+/// compressed bodies and decode them transparently, which breaks byte-range
+/// resumption. A caller that sets another `Accept-Encoding` gets
+/// backend-specific behaviour: Foundation and Cronet decode the body, reqwest
+/// and WinHTTP deliver it encoded.
+#[derive(Clone, Debug)]
 pub struct BackendConfig {
-    /// Request timeout
+    /// Total deadline per request; `None` (the default) for no deadline
     pub timeout: Option<Duration>,
+    /// Connect timeout; see the type documentation
+    pub connect_timeout: Option<Duration>,
+    /// Read (idle) timeout; see the type documentation
+    pub read_timeout: Option<Duration>,
     /// User agent string
     pub user_agent: Option<String>,
     /// Whether to ignore certificate errors
@@ -53,6 +85,29 @@ pub struct BackendConfig {
     pub https_proxy: Option<crate::client::ProxyConfig>,
     /// SOCKS proxy configuration
     pub socks_proxy: Option<crate::client::ProxyConfig>,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        let mut default_headers = http::HeaderMap::new();
+        default_headers.insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
+        Self {
+            timeout: None,
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            user_agent: None,
+            ignore_certificate_errors: None,
+            default_headers: Some(default_headers),
+            use_cookies: None,
+            cookie_jar: None,
+            http_proxy: None,
+            https_proxy: None,
+            socks_proxy: None,
+        }
+    }
 }
 
 /// HTTP client backend implementations
@@ -248,6 +303,25 @@ impl Backend {
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!("No backend available"),
+        }
+    }
+
+    /// The client-wide total deadline per request, if configured
+    pub(crate) fn total_timeout(&self) -> Option<Duration> {
+        match self {
+            #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
+            Backend::Foundation(f) => f.total_timeout(),
+
+            #[cfg(all(feature = "backend-winhttp", windows))]
+            Backend::Windows(w) => w.total_timeout(),
+
+            #[cfg(all(feature = "backend-android", target_os = "android"))]
+            Backend::Android(a) => a.total_timeout(),
+
+            #[cfg(feature = "backend-reqwest")]
+            Backend::Reqwest(r) => r.total_timeout(),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 

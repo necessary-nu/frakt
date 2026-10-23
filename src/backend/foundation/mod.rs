@@ -35,6 +35,7 @@ pub struct FoundationBackend {
     delegate: Retained<delegate::DataTaskDelegate>,
     cookie_jar: Option<crate::CookieJar>,
     default_headers: Option<http::HeaderMap>,
+    total_timeout: Option<std::time::Duration>,
 }
 
 impl FoundationBackend {
@@ -55,6 +56,7 @@ impl FoundationBackend {
             delegate,
             cookie_jar: None,
             default_headers: None,
+            total_timeout: None,
         })
     }
 
@@ -68,6 +70,7 @@ impl FoundationBackend {
             delegate,
             cookie_jar: None,
             default_headers: None,
+            total_timeout: None,
         }
     }
 
@@ -79,7 +82,7 @@ impl FoundationBackend {
             objc2_foundation::NSURLSessionConfiguration::defaultSessionConfiguration();
 
         // Apply timeout configuration
-        if let Some(timeout) = config.timeout {
+        if let Some(timeout) = config.read_timeout {
             session_config.setTimeoutIntervalForRequest(timeout.as_secs_f64());
         }
 
@@ -99,7 +102,12 @@ impl FoundationBackend {
             delegate,
             cookie_jar: config.cookie_jar,
             default_headers: config.default_headers,
+            total_timeout: config.timeout,
         })
+    }
+
+    pub(crate) fn total_timeout(&self) -> Option<std::time::Duration> {
+        self.total_timeout
     }
 
     /// Get the underlying NSURLSession (for WebSocket support)
@@ -337,7 +345,7 @@ impl FoundationBackend {
             status: status_code,
             headers,
             url: request.url,
-            body_receiver: rx,
+            body: crate::backend::types::channel_body(rx),
             redirect_headers: vec![],
         })
     }

@@ -741,7 +741,7 @@ async fn download_file_with_cronet(
         headers,
         body: None,
         progress_callback: None,
-        timeout: None,
+        read_timeout: None,
     };
 
     // Execute request
@@ -757,7 +757,7 @@ async fn download_file_with_cronet(
         .map_err(|e| Error::Internal(format!("Failed to create file: {}", e)))?;
 
     // Stream response to file
-    let mut body_receiver = response.body_receiver;
+    let mut body = response.body;
     let mut bytes_downloaded = 0u64;
     let total_bytes = response
         .headers
@@ -765,7 +765,7 @@ async fn download_file_with_cronet(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    while let Some(chunk_result) = body_receiver.recv().await {
+    while let Some(chunk_result) = futures_util::StreamExt::next(&mut body).await {
         match chunk_result {
             Ok(chunk) => {
                 use std::io::Write;

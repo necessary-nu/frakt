@@ -426,7 +426,7 @@ pub async fn execute_winhttp_request(
     let progress_callback = request.progress_callback;
 
     // Use request timeout if specified, otherwise fall back to backend timeout
-    let effective_timeout = request.timeout.as_ref().or(timeout.as_ref());
+    let effective_timeout = request.read_timeout.as_ref().or(timeout.as_ref());
 
     // Parse URL components
     let scheme = url.scheme();
@@ -902,7 +902,7 @@ async fn execute_async_winhttp(
             status,
             headers: response_headers,
             url: url.clone(),
-            body_receiver: rx,
+            body: crate::backend::types::channel_body(rx),
             redirect_headers: vec![],
         })
     }
