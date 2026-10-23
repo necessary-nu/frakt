@@ -86,6 +86,8 @@ block2 = { version = "0.6", default-features = false, optional = true }
 windows = { version = "0.62", optional = true, features = [
     # WinHTTP Client and WebSocket
     "Win32_Networking_WinHttp",
+    # Code page conversion of WinHTTP header text
+    "Win32_Globalization",
 
     # BITS for background downloads
     "Win32_Networking_BackgroundIntelligentTransferService",
