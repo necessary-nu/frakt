@@ -1,5 +1,16 @@
 //! WebSocket support with backend abstraction
 
+// With no WebSocket backend compiled in (Cronet without reqwest), WebSocket
+// has no variants and these methods never use their arguments.
+#![cfg_attr(
+    not(any(
+        feature = "backend-reqwest",
+        all(feature = "backend-foundation", target_vendor = "apple"),
+        all(feature = "backend-winhttp", windows)
+    )),
+    allow(unused_variables)
+)]
+
 use crate::{Error, Result};
 
 // Backend-specific implementations are in their respective modules
