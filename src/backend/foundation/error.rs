@@ -7,28 +7,32 @@ impl Error {
     pub(crate) fn from_ns_error(error: &objc2_foundation::NSError) -> Self {
         use objc2_foundation::NSURLErrorDomain;
 
-        let domain = error.domain();
-        let code = error.code();
-        let message = unsafe {
-            objc2::rc::autoreleasepool(|pool| error.localizedDescription().to_str(pool).to_string())
-        };
+        let domain = error.domain().to_string();
+        let code = error.code() as i64;
+        let message = error.localizedDescription().to_string();
 
-        if unsafe { domain.isEqualToString(&NSURLErrorDomain) } {
+        if domain == unsafe { NSURLErrorDomain }.to_string() {
             match code {
-                -1001 => Error::Timeout,
                 -999 => Error::Cancelled,
-                -1200..=-1000 => Error::Tls { message },
-                _ => Error::Network {
-                    code: code.try_into().unwrap(),
-                    message,
-                },
+                -1001 => Error::Timeout,
+                // NSURLErrorBadURL, NSURLErrorUnsupportedURL
+                -1000 | -1002 => Error::InvalidUrl,
+                // NSURLErrorClientCertificateRequired (-1206) through
+                // NSURLErrorSecureConnectionFailed (-1200): certificate and
+                // TLS handshake failures.
+                -1206..=-1200 => Error::Tls { message },
+                // Everything else in the domain, including cannot find host
+                // (-1003), cannot connect (-1004), connection lost (-1005),
+                // DNS lookup failed (-1006) and not connected (-1009), is a
+                // network failure.
+                _ => Error::Network { code, message },
             }
+        } else if domain == "NSPOSIXErrorDomain" || domain == "kCFErrorDomainCFNetwork" {
+            Error::Network { code, message }
         } else {
             Error::Internal(format!(
                 "Domain: {}, Code: {}, Message: {}",
-                unsafe { objc2::rc::autoreleasepool(|pool| domain.to_str(pool).to_string()) },
-                code,
-                message
+                domain, code, message
             ))
         }
     }
