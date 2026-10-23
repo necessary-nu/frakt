@@ -166,7 +166,7 @@ impl DataTaskState {
             if inner.suspended && inner.buffered <= LOW_WATER {
                 inner.suspended = false;
                 inner.last_activity = Instant::now();
-                task.resume();
+                objc2::rc::autoreleasepool(|_| task.resume());
             }
             return Poll::Ready(Some(Ok(chunk)));
         }

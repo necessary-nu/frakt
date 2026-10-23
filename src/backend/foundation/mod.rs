@@ -100,6 +100,10 @@ impl FoundationBackend {
     /// overridden. Cookies are off unless `use_cookies` is set or a cookie
     /// jar is given.
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
+        objc2::rc::autoreleasepool(|_| Self::create(config))
+    }
+
+    fn create(config: crate::backend::BackendConfig) -> Result<Self> {
         let proxy_credentials = [&config.socks_proxy, &config.https_proxy, &config.http_proxy]
             .into_iter()
             .flatten()
@@ -162,9 +166,11 @@ impl FoundationBackend {
     /// Execute an HTTP request using NSURLSession
     pub async fn execute(&self, request: BackendRequest) -> Result<BackendResponse> {
         let requested_url = request.url.clone();
-        // Dropping `body`, including dropping this future at the await,
-        // cancels the task.
-        let mut body = self.start(request)?;
+        // Foundation hands back autoreleased objects; on a runtime worker
+        // thread without a pool of its own they would live until the thread
+        // exits. Dropping `body`, including dropping this future at the
+        // await, cancels the task.
+        let mut body = objc2::rc::autoreleasepool(|_| self.start(request))?;
         let head = std::future::poll_fn(|cx| body.poll_head(cx)).await?;
 
         Ok(BackendResponse {
@@ -406,7 +412,7 @@ impl FoundationBody {
             let deadline = waiting_since.max(self.state.last_activity()) + timeout;
             if Instant::now() >= deadline {
                 self.finished = true;
-                self.task.cancel();
+                objc2::rc::autoreleasepool(|_| self.task.cancel());
                 self.state.discard();
                 return Poll::Ready(Error::Timeout);
             }
@@ -444,7 +450,7 @@ impl Stream for FoundationBody {
 impl Drop for FoundationBody {
     fn drop(&mut self) {
         if !self.finished {
-            self.task.cancel();
+            objc2::rc::autoreleasepool(|_| self.task.cancel());
             self.state.discard();
         }
     }
