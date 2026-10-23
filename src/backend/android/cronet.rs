@@ -102,12 +102,15 @@ fn configure_cronet_builder(
     )
     .map_err(|e| java_error(env, "CronetEngine.Builder.setStoragePath", e))?;
 
-    const HTTP_CACHE_DISK: i32 = 2;
+    // No HTTP cache: callers such as Pahkat stream large bodies to their own
+    // files, so a disk cache would only write every package twice, and
+    // byte-range resumption should see the server's answer, not a cached one.
+    const HTTP_CACHE_DISABLED: i32 = 0;
     env.call_method(
         builder,
         "enableHttpCache",
         "(IJ)Lorg/chromium/net/CronetEngine$Builder;",
-        &[JValue::Int(HTTP_CACHE_DISK), JValue::Long(50 * 1024 * 1024)],
+        &[JValue::Int(HTTP_CACHE_DISABLED), JValue::Long(0)],
     )
     .map_err(|e| java_error(env, "CronetEngine.Builder.enableHttpCache", e))?;
 
