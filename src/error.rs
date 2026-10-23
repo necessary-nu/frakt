@@ -62,14 +62,17 @@ pub enum Error {
     #[error("Invalid header")]
     InvalidHeader,
 
-    /// Network error from NSURLSession.
+    /// Network error.
     ///
-    /// This represents various network-level errors including DNS resolution failures,
-    /// connection refused, host unreachable, and other networking issues. The error
-    /// includes the original NSURLError code and a descriptive message.
+    /// DNS resolution failures, refused or reset connections, a connection
+    /// lost part-way through a body, and other transport failures that are
+    /// not TLS failures or timeouts.
     #[error("Network error: {message} (code: {code})")]
     Network {
-        /// Error code from NSURLError
+        /// The platform's own code, so it differs between backends: an
+        /// NSURLError code on Foundation, an ERROR_WINHTTP code on WinHTTP,
+        /// a Cronet NetworkException code on Android, and the OS error
+        /// number (or -1) on reqwest.
         code: i64,
         /// Error message
         message: String,
@@ -77,9 +80,9 @@ pub enum Error {
 
     /// TLS/Certificate error.
     ///
-    /// This error occurs when there are issues with SSL/TLS connections,
-    /// including certificate validation failures, protocol errors, or
-    /// other security-related issues.
+    /// The TLS handshake failed: the server's certificate was not trusted,
+    /// expired or for another host, or the connection could not be secured.
+    /// Retrying will not help.
     #[error("TLS error: {message}")]
     Tls {
         /// Error message
@@ -88,8 +91,9 @@ pub enum Error {
 
     /// Request timed out.
     ///
-    /// This error occurs when a request takes longer than the configured timeout
-    /// duration to complete. The timeout can be set using `Client::builder().timeout()`.
+    /// The network was idle for longer than the read timeout, or the request
+    /// ran past its total deadline. See
+    /// [`BackendConfig`](crate::backend::BackendConfig) for the timeouts.
     #[error("Request timed out")]
     Timeout,
 

@@ -241,7 +241,8 @@ frakt leverages platform-native performance optimizations:
 
 - **HTTP/2 and HTTP/3** support (when available)
 - **Connection pooling** and keep-alive
-- **Automatic compression** (gzip, deflate, br)
+- **Identity encoding by default**, so `Content-Length` and `Content-Range`
+  describe the bytes delivered and byte ranges can be resumed
 - **Native TLS** implementation
 - **Background processing** capabilities
 

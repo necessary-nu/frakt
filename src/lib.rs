@@ -209,7 +209,6 @@
 //! **Apple platforms** benefit from NSURLSession's optimized networking stack:
 //! - HTTP/2 and HTTP/3 support
 //! - Connection pooling and reuse
-//! - Automatic compression (gzip, deflate)
 //! - Network quality-of-service (QoS) handling
 //! - Cellular and Wi-Fi network management
 //! - True background transfer capabilities
@@ -217,8 +216,13 @@
 //! **Other platforms** use reqwest with additional features:
 //! - HTTP/2 support via reqwest
 //! - Connection pooling and keep-alive
-//! - Automatic decompression
 //! - Background downloads via daemon processes (Unix) or resumable downloads
+//!
+//! Every backend asks for `Accept-Encoding: identity` unless told otherwise,
+//! so bodies arrive as stored and `Content-Length` and `Content-Range`
+//! describe the bytes delivered; see
+//! [`BackendConfig`](crate::backend::BackendConfig) for this and for what
+//! the timeouts mean.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
