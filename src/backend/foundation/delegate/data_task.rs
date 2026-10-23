@@ -50,6 +50,8 @@ struct Inner {
     suspended: bool,
     outcome: Option<Result<()>>,
     waker: Option<Waker>,
+    /// The owner cancelled the task; data still in flight is dropped.
+    discarded: bool,
     /// Last time the network made progress: data sent or received, or the
     /// task resumed.
     last_activity: Instant,
@@ -80,6 +82,7 @@ impl DataTaskState {
                 suspended: false,
                 outcome: None,
                 waker: None,
+                discarded: false,
                 last_activity: Instant::now(),
             }),
             progress,
@@ -111,6 +114,9 @@ impl DataTaskState {
 
     fn on_data(&self, task: &NSURLSessionDataTask, chunk: Bytes) {
         let mut inner = self.lock();
+        if inner.discarded {
+            return;
+        }
         inner.last_activity = Instant::now();
         inner.buffered += chunk.len();
         inner.chunks.push_back(chunk);
@@ -177,6 +183,7 @@ impl DataTaskState {
     /// Drop buffered body data once the owner has cancelled the task.
     pub(crate) fn discard(&self) {
         let mut inner = self.lock();
+        inner.discarded = true;
         inner.chunks.clear();
         inner.buffered = 0;
         inner.waker = None;
