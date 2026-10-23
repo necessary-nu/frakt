@@ -115,6 +115,12 @@ vampire = { git = "https://github.com/bbqsrc/vampire-rs" }
 
 [dev-dependencies]
 vampire = { git = "https://github.com/bbqsrc/vampire-rs" }
+tokio = { version = "1", features = ["net", "macros", "rt-multi-thread", "time", "io-util"] }
+blake3 = { version = "1", features = ["pure"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+flate2 = "1"
+memory-stats = "1"
 
 [features]
 default = ["backend-reqwest"]
