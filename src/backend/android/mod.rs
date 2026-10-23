@@ -5,31 +5,24 @@ mod cronet;
 mod download;
 mod jni_bindings;
 mod request;
-mod response;
-
-#[cfg(test)]
-mod tests;
 
 use crate::backend::BackendConfig;
 use crate::backend::types::{BackendRequest, BackendResponse};
 use crate::{Error, Result};
+use callback::java_error;
 use jni::{
     JNIEnv, JavaVM,
-    objects::{GlobalRef, JObject},
+    objects::{GlobalRef, JClass, JObject, JValue},
 };
 use once_cell::sync::Lazy;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use url::Url;
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 static APP_CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
-
-// Global Cronet engine instance - created once and shared across all requests
-static CRONET_ENGINE: Lazy<Arc<GlobalRef>> = Lazy::new(|| {
-    let jvm = get_global_vm().expect("JavaVM unavailable");
-    let engine = cronet::create_cronet_engine(jvm).expect("Failed to create global Cronet engine");
-    Arc::new(engine)
-});
+static APP_CLASS_LOADER: OnceLock<GlobalRef> = OnceLock::new();
+static CALLBACK_EXECUTOR: OnceLock<GlobalRef> = OnceLock::new();
+static CRONET_ENGINE: Mutex<Option<Arc<GlobalRef>>> = Mutex::new(None);
 
 // Global Tokio runtime instance - created once for all async operations
 static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
@@ -46,8 +39,9 @@ static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
 /// client. The application context is taken from `context`. Later calls are
 /// ignored.
 ///
-/// Without it, the backend looks the VM up with `JNI_GetCreatedJavaVMs` and
-/// the context up with `ActivityThread.currentApplication()`, a non-SDK API.
+/// Without it, the backend looks the VM up with `JNI_GetCreatedJavaVMs`
+/// (Android 12 and later) and the context up with
+/// `ActivityThread.currentApplication()`, a non-SDK API.
 pub fn init(env: &mut JNIEnv, context: &JObject) -> Result<()> {
     let vm = env
         .get_java_vm()
@@ -92,8 +86,9 @@ pub(crate) fn get_global_vm() -> Result<&'static JavaVM> {
 
 /// Find the process's JavaVM without the host's help.
 ///
-/// `JNI_GetCreatedJavaVMs` is looked up at run time instead of linked because
-/// it is only in the NDK's public libraries from API 31.
+/// `JNI_GetCreatedJavaVMs` is looked up at run time instead of linked: the NDK
+/// only exports it to apps from API 31, through libnativehelper, and linker
+/// namespaces hide libart's copy from `RTLD_DEFAULT` lookups.
 fn discover_java_vm() -> Option<JavaVM> {
     type GetCreatedJavaVms = unsafe extern "system" fn(
         *mut *mut jni::sys::JavaVM,
@@ -101,7 +96,15 @@ fn discover_java_vm() -> Option<JavaVM> {
         *mut jni::sys::jsize,
     ) -> jni::sys::jint;
 
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"JNI_GetCreatedJavaVMs".as_ptr()) };
+    let name = c"JNI_GetCreatedJavaVMs";
+    let mut symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if symbol.is_null() {
+        // Already mapped in every app process; dlopen only takes a reference.
+        let library = unsafe { libc::dlopen(c"libnativehelper.so".as_ptr(), libc::RTLD_NOW) };
+        if !library.is_null() {
+            symbol = unsafe { libc::dlsym(library, name.as_ptr()) };
+        }
+    }
     if symbol.is_null() {
         return None;
     }
@@ -125,9 +128,110 @@ pub(crate) fn application_context() -> Result<&'static GlobalRef> {
     Ok(APP_CONTEXT.get_or_init(|| context))
 }
 
-/// Get the global Cronet engine instance
-fn get_global_cronet_engine() -> Arc<GlobalRef> {
-    CRONET_ENGINE.clone()
+/// Run `f` in its own JNI local reference frame.
+///
+/// Threads attached from native code never return to Java, so local
+/// references they create are only freed by popping a frame.
+pub(crate) fn local_frame<T>(
+    env: &mut JNIEnv,
+    capacity: i32,
+    f: impl FnOnce(&mut JNIEnv) -> Result<T>,
+) -> Result<T> {
+    env.push_local_frame(capacity)
+        .map_err(|e| java_error(env, "PushLocalFrame", e))?;
+    let result = f(env);
+    // SAFETY: nothing created in the frame outlives it; results are global
+    // references or Rust values.
+    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+    result
+}
+
+/// The application's class loader.
+///
+/// JNI `FindClass` on a thread attached from native code only sees system
+/// classes, so app classes such as Cronet's are loaded through this instead.
+pub(crate) fn app_class_loader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+    if let Some(loader) = APP_CLASS_LOADER.get() {
+        return Ok(loader);
+    }
+    let context = application_context()?;
+    let loader = env
+        .call_method(
+            context.as_obj(),
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| java_error(env, "Context.getClassLoader", e))?;
+    let loader = env
+        .new_global_ref(loader)
+        .map_err(|e| java_error(env, "NewGlobalRef", e))?;
+    Ok(APP_CLASS_LOADER.get_or_init(|| loader))
+}
+
+/// Load a class by binary name (`org.chromium.net.CronetEngine$Builder`)
+/// through `loader`.
+pub(crate) fn load_class_with<'a>(
+    env: &mut JNIEnv<'a>,
+    loader: &GlobalRef,
+    class_name: &str,
+) -> Result<JClass<'a>> {
+    let name = env
+        .new_string(class_name)
+        .map_err(|e| java_error(env, "NewString", e))?;
+    let class = env
+        .call_method(
+            loader.as_obj(),
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&name)],
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| java_error(env, &format!("loadClass({})", class_name), e))?;
+    Ok(JClass::from(class))
+}
+
+/// Load an application class, such as Cronet's, from any thread.
+pub(crate) fn load_app_class<'a>(env: &mut JNIEnv<'a>, class_name: &str) -> Result<JClass<'a>> {
+    let loader = app_class_loader(env)?;
+    load_class_with(env, loader, class_name)
+}
+
+/// The executor every request's callbacks and uploads run on. Callbacks only
+/// copy data and hand off to Rust, so one shared pool serves all requests.
+pub(crate) fn callback_executor(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+    if let Some(executor) = CALLBACK_EXECUTOR.get() {
+        return Ok(executor);
+    }
+    let executor = env
+        .call_static_method(
+            "java/util/concurrent/Executors",
+            "newCachedThreadPool",
+            "()Ljava/util/concurrent/ExecutorService;",
+            &[],
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| java_error(env, "Executors.newCachedThreadPool", e))?;
+    let executor = env
+        .new_global_ref(executor)
+        .map_err(|e| java_error(env, "NewGlobalRef", e))?;
+    Ok(CALLBACK_EXECUTOR.get_or_init(|| executor))
+}
+
+/// The process's Cronet engine, created on first use.
+fn get_global_cronet_engine() -> Result<Arc<GlobalRef>> {
+    let mut engine = CRONET_ENGINE.lock().unwrap();
+    if let Some(engine) = engine.as_ref() {
+        return Ok(engine.clone());
+    }
+    let jvm = get_global_vm()?;
+    let mut env = jvm
+        .attach_current_thread_as_daemon()
+        .map_err(|e| Error::Internal(format!("Failed to attach to the JVM: {}", e)))?;
+    let created = Arc::new(local_frame(&mut env, 32, cronet::create_cronet_engine)?);
+    *engine = Some(created.clone());
+    Ok(created)
 }
 
 /// Get the global tokio runtime instance
@@ -143,7 +247,7 @@ pub fn start_netlog() -> Result<String> {
         .attach_current_thread()
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
-    let engine = get_global_cronet_engine();
+    let engine = get_global_cronet_engine()?;
 
     // Get the application context to access files directory
     let context = application_context()?;
@@ -209,7 +313,6 @@ pub fn start_netlog() -> Result<String> {
     .map_err(|e| Error::Internal(format!("Failed to start NetLog: {}", e)))?;
 
     tracing::info!("NetLog started, writing to: {}", path_string);
-    println!("🔍 NetLog started: {}", path_string);
 
     Ok(path_string)
 }
@@ -221,13 +324,12 @@ pub fn stop_netlog() -> Result<()> {
         .attach_current_thread()
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
-    let engine = get_global_cronet_engine();
+    let engine = get_global_cronet_engine()?;
 
     env.call_method(engine.as_obj(), "stopNetLog", "()V", &[])
         .map_err(|e| Error::Internal(format!("Failed to stop NetLog: {}", e)))?;
 
     tracing::info!("NetLog stopped");
-    println!("🔍 NetLog stopped");
 
     Ok(())
 }
@@ -364,12 +466,10 @@ pub fn list_permissions() -> Result<Vec<String>> {
                     Error::Internal(format!("Failed to convert permission string: {}", e))
                 })?
                 .into();
-            println!("📋 Permission: {}", permission_str);
             permissions.push(permission_str);
         }
     }
 
-    println!("📋 Total permissions: {}", permissions.len());
     Ok(permissions)
 }
 
@@ -496,21 +596,13 @@ pub struct AndroidBackend {
 impl AndroidBackend {
     /// Create a new Android backend with default configuration
     pub fn new() -> Result<Self> {
-        let jvm = get_global_vm()?;
-        let cronet_engine = get_global_cronet_engine();
-
-        Ok(Self {
-            jvm,
-            cronet_engine,
-            cookie_storage: None,
-            config: BackendConfig::default(),
-        })
+        Self::with_config(BackendConfig::default())
     }
 
     /// Create a new Android backend with configuration
     pub fn with_config(config: BackendConfig) -> Result<Self> {
         let jvm = get_global_vm()?;
-        let cronet_engine = get_global_cronet_engine();
+        let cronet_engine = get_global_cronet_engine()?;
 
         // Create cookie storage if cookies are enabled
         let cookie_storage = if config.use_cookies.unwrap_or(false) {
@@ -537,14 +629,23 @@ impl AndroidBackend {
             }
         }
 
-        if request.read_timeout.is_none() {
-            request.read_timeout = self.config.read_timeout;
-        }
+        let read_timeout = request.read_timeout.or(self.config.read_timeout);
 
         // Apply default headers from config (don't override existing headers)
         if let Some(ref default_headers) = self.config.default_headers {
             for (name, value) in default_headers {
                 request.headers.entry(name).or_insert(value.clone());
+            }
+        }
+
+        // The engine is shared between clients, so the user agent goes on
+        // each request.
+        if let Some(user_agent) = &self.config.user_agent {
+            if let Ok(value) = http::HeaderValue::from_str(user_agent) {
+                request
+                    .headers
+                    .entry(http::header::USER_AGENT)
+                    .or_insert(value);
             }
         }
 
@@ -557,7 +658,8 @@ impl AndroidBackend {
             }
         }
 
-        let response = request::execute_request(self.jvm, &self.cronet_engine, request).await?;
+        let response =
+            request::execute_request(self.jvm, &self.cronet_engine, request, read_timeout).await?;
 
         // Process Set-Cookie headers from redirect responses first
         if let Some(ref cookie_storage) = self.cookie_storage {

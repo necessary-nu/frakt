@@ -6,16 +6,13 @@ import org.chromium.net.CronetException;
 import java.nio.ByteBuffer;
 
 /**
- * Minimal UrlRequest.Callback implementation that delegates to Rust via JNI.
- * This class is compiled at build time and embedded in the binary.
+ * UrlRequest.Callback that forwards every callback to frakt's Rust code with
+ * the request's handler id. The natives are registered by frakt when it loads
+ * this class from its embedded DEX.
  *
- * All methods are native and implemented in Rust.
+ * Reading is driven from Rust: no callback here calls UrlRequest.read().
  */
 public class RustUrlRequestCallback extends UrlRequest.Callback {
-    // static {
-    //     System.loadLibrary("frakt");
-    // }
-
     private final long handlerId;
 
     public RustUrlRequestCallback(long handlerId) {
@@ -23,77 +20,50 @@ public class RustUrlRequestCallback extends UrlRequest.Callback {
     }
 
     @Override
-    public void onRedirectReceived(
-        UrlRequest request,
-        UrlResponseInfo info,
-        String newLocationUrl
-    ) throws Exception {
-        nativeOnRedirectReceived(request, info, newLocationUrl);
+    public void onRedirectReceived(UrlRequest request, UrlResponseInfo info, String newLocationUrl) {
+        nativeOnRedirectReceived(handlerId, request, info);
     }
 
     @Override
-    public void onResponseStarted(
-        UrlRequest request,
-        UrlResponseInfo info
-    ) throws Exception {
-        nativeOnResponseStarted(request, info);
+    public void onResponseStarted(UrlRequest request, UrlResponseInfo info) {
+        nativeOnResponseStarted(handlerId, request, info);
     }
 
     @Override
-    public void onReadCompleted(
-        UrlRequest request,
-        UrlResponseInfo info,
-        ByteBuffer byteBuffer
-    ) throws Exception {
-        nativeOnReadCompleted(request, info, byteBuffer);
+    public void onReadCompleted(UrlRequest request, UrlResponseInfo info, ByteBuffer byteBuffer) {
+        // The data is at [0, position). Clearing first lets Rust hand the
+        // same buffer to the next read() as soon as it has copied the data.
+        int length = byteBuffer.position();
+        byteBuffer.clear();
+        nativeOnReadCompleted(handlerId, request, info, byteBuffer, length);
     }
 
     @Override
-    public void onSucceeded(
-        UrlRequest request,
-        UrlResponseInfo info
-    ) {
-        nativeOnSucceeded(request, info);
+    public void onSucceeded(UrlRequest request, UrlResponseInfo info) {
+        nativeOnSucceeded(handlerId, request, info);
     }
 
     @Override
-    public void onFailed(
-        UrlRequest request,
-        UrlResponseInfo info,
-        CronetException error
-    ) {
-        nativeOnFailed(request, info, error);
+    public void onFailed(UrlRequest request, UrlResponseInfo info, CronetException error) {
+        nativeOnFailed(handlerId, request, info, error);
     }
 
-    private native void nativeOnRedirectReceived(
-        UrlRequest request,
-        UrlResponseInfo info,
-        String newLocationUrl
-    ) throws Exception;
-
-    private native void nativeOnResponseStarted(
-        UrlRequest request,
-        UrlResponseInfo info
-    ) throws Exception;
-
-    private native void nativeOnReadCompleted(
-        UrlRequest request,
-        UrlResponseInfo info,
-        ByteBuffer byteBuffer
-    ) throws Exception;
-
-    private native void nativeOnSucceeded(
-        UrlRequest request,
-        UrlResponseInfo info
-    );
-
-    private native void nativeOnFailed(
-        UrlRequest request,
-        UrlResponseInfo info,
-        CronetException error
-    );
-
-    public long getHandlerId() {
-        return handlerId;
+    @Override
+    public void onCanceled(UrlRequest request, UrlResponseInfo info) {
+        nativeOnCanceled(handlerId, request, info);
     }
+
+    private static native void nativeOnRedirectReceived(long handlerId, UrlRequest request, UrlResponseInfo info);
+
+    private static native void nativeOnResponseStarted(long handlerId, UrlRequest request, UrlResponseInfo info);
+
+    private static native void nativeOnReadCompleted(
+        long handlerId, UrlRequest request, UrlResponseInfo info, ByteBuffer byteBuffer, int length);
+
+    private static native void nativeOnSucceeded(long handlerId, UrlRequest request, UrlResponseInfo info);
+
+    private static native void nativeOnFailed(
+        long handlerId, UrlRequest request, UrlResponseInfo info, CronetException error);
+
+    private static native void nativeOnCanceled(long handlerId, UrlRequest request, UrlResponseInfo info);
 }

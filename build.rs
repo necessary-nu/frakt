@@ -26,6 +26,7 @@ fn main() {
         java_dir.join("stubs/org/chromium/net/UploadDataProvider.java"),
         java_dir.join("stubs/org/chromium/net/UploadDataSink.java"),
         // Java NIO stubs
+        java_dir.join("stubs/java/nio/Buffer.java"),
         java_dir.join("stubs/java/nio/ByteBuffer.java"),
         // Android stubs
         java_dir.join("stubs/android/content/Context.java"),

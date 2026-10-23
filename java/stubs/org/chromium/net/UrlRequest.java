@@ -56,5 +56,10 @@ public abstract class UrlRequest {
             UrlResponseInfo info,
             CronetException error
         );
+
+        /**
+         * Called when the request is canceled.
+         */
+        public void onCanceled(UrlRequest request, UrlResponseInfo info) {}
     }
 }

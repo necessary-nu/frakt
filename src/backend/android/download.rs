@@ -8,7 +8,7 @@ use jni::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use url::Url;
 
 // Global storage for progress callbacks
@@ -36,7 +36,7 @@ fn ensure_workmanager_initialized(jvm: &JavaVM) -> Result<()> {
         .attach_current_thread()
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
-    let context = get_application_context(&jvm)?;
+    let context = super::application_context()?;
 
     // Try to get WorkManager instance to see if it's initialized
     let work_manager_class = env
@@ -44,18 +44,18 @@ fn ensure_workmanager_initialized(jvm: &JavaVM) -> Result<()> {
         .map_err(|e| Error::Internal(format!("Failed to find WorkManager class: {}", e)))?;
 
     // Try getInstance - if it throws, we need to initialize
-    let get_instance_result = env.call_static_method(
+    let _ = env.call_static_method(
         &work_manager_class,
         "getInstance",
         "(Landroid/content/Context;)Landroidx/work/WorkManager;",
-        &[(&context).into()],
+        &[context.as_obj().into()],
     );
 
     // Check if there was an exception (WorkManager not initialized)
     if env.exception_check().unwrap_or(false) {
         env.exception_clear().ok();
 
-        println!("🔧 Initializing WorkManager with custom DexWorkerFactory...");
+        tracing::debug!("Initializing WorkManager with custom DexWorkerFactory...");
 
         // Get DEX classloader from callback module
         let dex_classloader_ref = crate::backend::android::callback::get_dex_classloader(&mut env)?;
@@ -128,11 +128,11 @@ fn ensure_workmanager_initialized(jvm: &JavaVM) -> Result<()> {
             work_manager_class,
             "initialize",
             "(Landroid/content/Context;Landroidx/work/Configuration;)V",
-            &[(&context).into(), (&config).into()],
+            &[context.as_obj().into(), (&config).into()],
         )
         .map_err(|e| Error::Internal(format!("Failed to initialize WorkManager: {}", e)))?;
 
-        println!("✅ WorkManager initialized successfully with DexWorkerFactory");
+        tracing::debug!("WorkManager initialized successfully with DexWorkerFactory");
     }
 
     // Pre-register DownloadProgressCallback native methods
@@ -150,7 +150,7 @@ pub async fn execute_background_download(
     jvm: &JavaVM,
     url: Url,
     file_path: PathBuf,
-    session_identifier: Option<String>,
+    _session_identifier: Option<String>,
     headers: http::HeaderMap,
     _error_for_status: bool,
     progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
@@ -163,7 +163,7 @@ pub async fn execute_background_download(
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
     // Get application context
-    let context = get_application_context(&jvm)?;
+    let context = super::application_context()?;
 
     // Get WorkManager instance
     let work_manager_class = env
@@ -175,7 +175,7 @@ pub async fn execute_background_download(
             work_manager_class,
             "getInstance",
             "(Landroid/content/Context;)Landroidx/work/WorkManager;",
-            &[(&context).into()],
+            &[context.as_obj().into()],
         )
         .map_err(|e| Error::Internal(format!("Failed to get WorkManager instance: {}", e)))?
         .l()
@@ -249,6 +249,7 @@ pub async fn execute_background_download(
         &mut env,
         "se.brendan.frakt.DownloadWorker",
     )?;
+    register_download_worker_methods(&mut env, &worker_class)?;
 
     // Create OneTimeWorkRequest.Builder
     let request_builder_class = env
@@ -347,6 +348,7 @@ pub async fn execute_background_download(
         &mut env,
         "se.brendan.frakt.DownloadWorker",
     )?;
+    register_download_worker_methods(&mut env, &worker_class)?;
 
     // Create OneTimeWorkRequest.Builder
     let request_builder_class = env
@@ -419,10 +421,7 @@ pub async fn execute_background_download(
     )
     .map_err(|e| Error::Internal(format!("Failed to enqueue work: {}", e)))?;
 
-    println!(
-        "📥 Enqueued background download with work ID: {}",
-        work_id_str
-    );
+    tracing::debug!("Enqueued background download with work ID: {}", work_id_str);
 
     // Poll for completion
     let start_time = std::time::Instant::now();
@@ -484,15 +483,12 @@ pub async fn execute_background_download(
             .into();
 
         if iteration % 10 == 0 {
-            println!(
-                "📊 Download status: {} (iteration {})",
-                state_str, iteration
-            );
+            tracing::debug!("Download status: {} (iteration {})", state_str, iteration);
         }
 
         match state_str.as_str() {
             "SUCCEEDED" => {
-                println!("✅ Background download completed successfully");
+                tracing::debug!("Background download completed successfully");
                 break;
             }
             "FAILED" | "CANCELLED" => {
@@ -527,37 +523,6 @@ pub async fn execute_background_download(
     })
 }
 
-/// Get the Android application context
-fn get_application_context<'a>(jvm: &'a JavaVM) -> Result<JObject<'a>> {
-    let mut env = jvm
-        .attach_current_thread()
-        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
-
-    let activity_thread_class = env
-        .find_class("android/app/ActivityThread")
-        .map_err(|e| Error::Internal(format!("Failed to find ActivityThread class: {}", e)))?;
-
-    let current_activity_thread = env
-        .call_static_method(
-            activity_thread_class,
-            "currentActivityThread",
-            "()Landroid/app/ActivityThread;",
-            &[],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to get current ActivityThread: {}", e)))?;
-
-    let context = env
-        .call_method(
-            current_activity_thread.l().unwrap(),
-            "getApplication",
-            "()Landroid/app/Application;",
-            &[],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to get application context: {}", e)))?;
-
-    Ok(context.l().unwrap())
-}
-
 /// Convert HeaderMap to a simple map for JSON serialization
 fn headers_to_map(headers: &http::HeaderMap) -> std::collections::HashMap<String, String> {
     headers
@@ -571,24 +536,11 @@ fn headers_to_map(headers: &http::HeaderMap) -> std::collections::HashMap<String
         .collect()
 }
 
-/// Native JNI function called by BackgroundDownloader to perform the actual download
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_se_brendan_frakt_BackgroundDownloader_nativeDownload(
-    mut env: JNIEnv,
-    _class: JClass,
-    url: JString,
-    file_path: JString,
-    headers_json: JString,
-    progress_callback: JObject,
-) -> jint {
-    perform_download_impl(env, url, file_path, headers_json, progress_callback)
-}
-
-/// Native JNI function called by DownloadWorker to perform the actual download
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_se_brendan_frakt_DownloadWorker_nativeDownload(
-    mut env: JNIEnv,
-    _class: JClass,
+/// `nativeDownload` of both `BackgroundDownloader` (static) and
+/// `DownloadWorker` (instance).
+extern "system" fn native_download(
+    env: JNIEnv,
+    _this_or_class: JObject,
     url: JString,
     file_path: JString,
     headers_json: JString,
@@ -605,7 +557,7 @@ fn perform_download_impl(
     headers_json: JString,
     progress_callback: JObject,
 ) -> jint {
-    println!("🚀 NATIVE nativeDownload() called!");
+    tracing::debug!("NATIVE nativeDownload() called!");
 
     // Get JVM
     let jvm = match env.get_java_vm() {
@@ -675,7 +627,7 @@ fn perform_download_impl(
         }
     };
 
-    println!("🔧 Starting download with Cronet...");
+    tracing::debug!("Starting download with Cronet...");
 
     // Spawn on the global runtime and wait for completion in a separate thread
     let runtime = crate::backend::android::get_runtime();
@@ -695,7 +647,7 @@ fn perform_download_impl(
     let result = match thread_result {
         Ok(task_result) => task_result,
         Err(e) => {
-            eprintln!("❌ Thread panic: {:?}", e);
+            tracing::debug!("Thread panic: {:?}", e);
             tracing::error!("Thread panic: {:?}", e);
             return -3;
         }
@@ -704,14 +656,14 @@ fn perform_download_impl(
     // Handle task result
     match result {
         Ok(bytes_downloaded) => {
-            println!(
-                "✅ Download completed successfully: {} bytes",
+            tracing::debug!(
+                "Download completed successfully: {} bytes",
                 bytes_downloaded
             );
             0
         }
         Err(e) => {
-            eprintln!("❌ Download failed: {}", e);
+            tracing::debug!("Download failed: {}", e);
             tracing::error!("Download failed: {}", e);
             -1
         }
@@ -731,8 +683,9 @@ async fn download_file_with_cronet(
     use crate::backend::types::BackendRequest;
     use http::Method;
 
-    // Get Cronet engine
-    let cronet_engine = super::get_global_cronet_engine();
+    let _ = jvm;
+    let jvm = super::get_global_vm()?;
+    let cronet_engine = super::get_global_cronet_engine()?;
 
     // Create request
     let request = BackendRequest {
@@ -745,7 +698,7 @@ async fn download_file_with_cronet(
     };
 
     // Execute request
-    let response = request::execute_request(jvm, &cronet_engine, request).await?;
+    let response = request::execute_request(jvm, &cronet_engine, request, None).await?;
 
     // Create file
     if let Some(parent) = file_path.parent() {
@@ -794,8 +747,8 @@ async fn download_file_with_cronet(
         }
     }
 
-    println!(
-        "✅ Download complete: {} bytes to {}",
+    tracing::debug!(
+        "Download complete: {} bytes to {}",
         bytes_downloaded,
         file_path.display()
     );
@@ -803,8 +756,7 @@ async fn download_file_with_cronet(
 }
 
 /// JNI function called by DownloadProgressCallback to invoke Rust callback
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_se_brendan_frakt_DownloadProgressCallback_nativeOnProgress(
+extern "system" fn native_on_progress(
     _env: JNIEnv,
     _class: JClass,
     handler_id: i64,
@@ -834,7 +786,7 @@ fn register_background_downloader_methods(env: &mut JNIEnv, class: &JClass) -> R
         NativeMethod {
             name: "nativeDownload".into(),
             sig: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Lse/brendan/frakt/DownloadProgressCallback;)I".into(),
-            fn_ptr: Java_se_brendan_frakt_BackgroundDownloader_nativeDownload as *mut std::ffi::c_void,
+            fn_ptr: native_download as *mut std::ffi::c_void,
         },
     ];
 
@@ -849,6 +801,23 @@ fn register_background_downloader_methods(env: &mut JNIEnv, class: &JClass) -> R
     Ok(())
 }
 
+/// Register `nativeDownload` on `DownloadWorker`. Classes from the embedded
+/// DEX cannot find natives by symbol name, so they must be registered.
+fn register_download_worker_methods(env: &mut JNIEnv, class: &JClass) -> Result<()> {
+    let native_methods = [jni::NativeMethod {
+        name: "nativeDownload".into(),
+        sig: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Lse/brendan/frakt/DownloadProgressCallback;)I".into(),
+        fn_ptr: native_download as *mut std::ffi::c_void,
+    }];
+    env.register_native_methods(class, &native_methods)
+        .map_err(|e| {
+            Error::Internal(format!(
+                "Failed to register DownloadWorker native methods: {}",
+                e
+            ))
+        })
+}
+
 /// Register native methods for DownloadProgressCallback class
 fn register_progress_callback_methods(env: &mut JNIEnv, class: &JClass) -> Result<()> {
     use jni::NativeMethod;
@@ -859,8 +828,7 @@ fn register_progress_callback_methods(env: &mut JNIEnv, class: &JClass) -> Resul
     let native_methods = [NativeMethod {
         name: "nativeOnProgress".into(),
         sig: "(JJJ)V".into(),
-        fn_ptr: Java_se_brendan_frakt_DownloadProgressCallback_nativeOnProgress
-            as *mut std::ffi::c_void,
+        fn_ptr: native_on_progress as *mut std::ffi::c_void,
     }];
 
     env.register_native_methods(jclass, &native_methods)
