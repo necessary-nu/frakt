@@ -13,21 +13,20 @@ mod tests;
 use crate::backend::BackendConfig;
 use crate::backend::types::{BackendRequest, BackendResponse};
 use crate::{Error, Result};
-use jni::{JavaVM, objects::GlobalRef};
+use jni::{
+    JNIEnv, JavaVM,
+    objects::{GlobalRef, JObject},
+};
 use once_cell::sync::Lazy;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use url::Url;
 
-// Global JavaVM instance for Android - lives forever
-static ANDROID_JVM: Lazy<&'static JavaVM> = Lazy::new(|| {
-    Box::leak(Box::new(unsafe {
-        jni::JavaVM::from_raw(vampire::java_vm() as *mut _).unwrap()
-    }))
-});
+static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+static APP_CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
 
 // Global Cronet engine instance - created once and shared across all requests
 static CRONET_ENGINE: Lazy<Arc<GlobalRef>> = Lazy::new(|| {
-    let jvm = *ANDROID_JVM;
+    let jvm = get_global_vm().expect("JavaVM unavailable");
     let engine = cronet::create_cronet_engine(jvm).expect("Failed to create global Cronet engine");
     Arc::new(engine)
 });
@@ -40,9 +39,90 @@ static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .expect("Failed to create global tokio runtime")
 });
 
+/// Give the Android backend the JavaVM and an Android `Context`.
+///
+/// A host that loads frakt from its own JNI code should call this once, for
+/// example from its `JNI_OnLoad` or first JNI entry point, before creating a
+/// client. The application context is taken from `context`. Later calls are
+/// ignored.
+///
+/// Without it, the backend looks the VM up with `JNI_GetCreatedJavaVMs` and
+/// the context up with `ActivityThread.currentApplication()`, a non-SDK API.
+pub fn init(env: &mut JNIEnv, context: &JObject) -> Result<()> {
+    let vm = env
+        .get_java_vm()
+        .map_err(|e| Error::Internal(format!("Failed to get JavaVM: {}", e)))?;
+    let _ = JAVA_VM.set(vm);
+
+    if !context.is_null() && APP_CONTEXT.get().is_none() {
+        let app = env
+            .call_method(
+                context,
+                "getApplicationContext",
+                "()Landroid/content/Context;",
+                &[],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| Error::Internal(format!("Failed to get application context: {}", e)))?;
+        let app = if app.is_null() {
+            env.new_global_ref(context)
+        } else {
+            env.new_global_ref(&app)
+        }
+        .map_err(|e| Error::Internal(format!("Failed to retain context: {}", e)))?;
+        let _ = APP_CONTEXT.set(app);
+    }
+
+    Ok(())
+}
+
 /// Get the global JavaVM instance
 pub(crate) fn get_global_vm() -> Result<&'static JavaVM> {
-    Ok(*ANDROID_JVM)
+    if let Some(vm) = JAVA_VM.get() {
+        return Ok(vm);
+    }
+    let vm = discover_java_vm().ok_or_else(|| {
+        Error::Internal(
+            "No JavaVM found; call frakt::backend::android::init before using the Android backend"
+                .to_string(),
+        )
+    })?;
+    Ok(JAVA_VM.get_or_init(|| vm))
+}
+
+/// Find the process's JavaVM without the host's help.
+///
+/// `JNI_GetCreatedJavaVMs` is looked up at run time instead of linked because
+/// it is only in the NDK's public libraries from API 31.
+fn discover_java_vm() -> Option<JavaVM> {
+    type GetCreatedJavaVms = unsafe extern "system" fn(
+        *mut *mut jni::sys::JavaVM,
+        jni::sys::jsize,
+        *mut jni::sys::jsize,
+    ) -> jni::sys::jint;
+
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"JNI_GetCreatedJavaVMs".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    let get_created: GetCreatedJavaVms = unsafe { std::mem::transmute(symbol) };
+    let mut vm: *mut jni::sys::JavaVM = std::ptr::null_mut();
+    let mut count: jni::sys::jsize = 0;
+    let status = unsafe { get_created(&mut vm, 1, &mut count) };
+    if status != jni::sys::JNI_OK || count < 1 || vm.is_null() {
+        return None;
+    }
+    unsafe { JavaVM::from_raw(vm) }.ok()
+}
+
+/// The application context given to [`init`], or the one found through
+/// `ActivityThread`.
+pub(crate) fn application_context() -> Result<&'static GlobalRef> {
+    if let Some(context) = APP_CONTEXT.get() {
+        return Ok(context);
+    }
+    let context = cronet::find_application_context()?;
+    Ok(APP_CONTEXT.get_or_init(|| context))
 }
 
 /// Get the global Cronet engine instance
@@ -66,7 +146,7 @@ pub fn start_netlog() -> Result<String> {
     let engine = get_global_cronet_engine();
 
     // Get the application context to access files directory
-    let context = cronet::get_application_context()?;
+    let context = application_context()?;
 
     // Get external files directory
     let files_dir = env
@@ -159,7 +239,7 @@ pub fn check_permission(permission: &str) -> Result<bool> {
         .attach_current_thread()
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
-    let context = cronet::get_application_context()?;
+    let context = application_context()?;
 
     let permission_jstring = env
         .new_string(permission)
@@ -187,7 +267,7 @@ pub fn list_permissions() -> Result<Vec<String>> {
         .attach_current_thread()
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
-    let context = cronet::get_application_context()?;
+    let context = application_context()?;
 
     // Get PackageManager
     let package_manager = env

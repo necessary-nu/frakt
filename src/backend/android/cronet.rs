@@ -17,7 +17,7 @@ pub fn create_cronet_engine_with_config(jvm: &JavaVM, config: &BackendConfig) ->
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
     // Get Android application context
-    let context = get_application_context()?;
+    let context = super::application_context()?;
 
     // Create CronetEngine.Builder
     let builder_class = env
@@ -260,44 +260,29 @@ fn configure_cronet_builder(
     Ok(())
 }
 
-/// Get the Android application context using ActivityThread
-pub(crate) fn get_application_context() -> Result<GlobalRef> {
-    // We need to get the JavaVM to attach and get the context
+/// Find the application context through `ActivityThread.currentApplication()`.
+pub(crate) fn find_application_context() -> Result<GlobalRef> {
     let jvm = super::get_global_vm()?;
     let mut env = jvm
         .attach_current_thread()
         .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
 
-    // Get ActivityThread class
-    let activity_thread_class = env
-        .find_class("android/app/ActivityThread")
-        .map_err(|e| Error::Internal(format!("Failed to find ActivityThread class: {}", e)))?;
-
-    // Get current ActivityThread
-    let current_activity_thread = env
-        .call_static_method(
-            activity_thread_class,
-            "currentActivityThread",
-            "()Landroid/app/ActivityThread;",
-            &[],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to get current ActivityThread: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert ActivityThread: {}", e)))?;
-
-    // Get Application (which is a Context)
     let application = env
-        .call_method(
-            &current_activity_thread,
-            "getApplication",
+        .call_static_method(
+            "android/app/ActivityThread",
+            "currentApplication",
             "()Landroid/app/Application;",
             &[],
         )
-        .map_err(|e| Error::Internal(format!("Failed to get Application: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert Application: {}", e)))?;
+        .and_then(|v| v.l())
+        .map_err(|e| Error::Internal(format!("Failed to get current Application: {}", e)))?;
 
-    // Create a global reference so it lives long enough
+    if application.is_null() {
+        return Err(Error::Internal(
+            "No Application context; call frakt::backend::android::init".to_string(),
+        ));
+    }
+
     env.new_global_ref(&application)
         .map_err(|e| Error::Internal(format!("Failed to create global ref for context: {}", e)))
 }

@@ -254,9 +254,10 @@ mod response;
 mod task;
 mod websocket;
 
+#[cfg(all(target_os = "android", vampire))]
 pub use vampire::JNI_OnLoad;
 
-#[cfg(vampire)]
+#[cfg(all(target_os = "android", vampire))]
 #[path = "../tests"]
 mod android_tests {
     #[path = "integration_tests.rs"]
