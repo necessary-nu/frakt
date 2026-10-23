@@ -308,6 +308,7 @@ dependencies = [
  "pathos",
  "rand",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

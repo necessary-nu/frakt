@@ -119,15 +119,66 @@ impl Stream for ReqwestBody {
     }
 }
 
+/// Classify a reqwest error as timeout, TLS or other network failure.
 fn map_reqwest_error(error: reqwest::Error) -> Error {
+    use std::error::Error as _;
+
     if error.is_timeout() {
-        Error::Timeout
-    } else {
-        Error::Network {
-            code: -1,
-            message: format!("Request failed: {}", error),
-        }
+        return Error::Timeout;
     }
+    if error.is_builder() {
+        return Error::Internal(format!("Invalid request: {}", error));
+    }
+
+    let message = error_chain_message(&error);
+    let mut code = None;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
+    while let Some(err) = source {
+        if err.is::<rustls::Error>() {
+            return Error::Tls { message };
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if wraps_rustls_error(io) {
+                return Error::Tls { message };
+            }
+            if io.kind() == std::io::ErrorKind::TimedOut {
+                return Error::Timeout;
+            }
+            code = code.or(io.raw_os_error());
+        }
+        source = err.source();
+    }
+
+    Error::Network {
+        code: code.map(i64::from).unwrap_or(-1),
+        message,
+    }
+}
+
+/// io::Error::source skips the error an io::Error wraps, and hyper-rustls
+/// wraps the rustls error in two io::Errors, so unwrap them by hand.
+fn wraps_rustls_error(io: &std::io::Error) -> bool {
+    let mut inner = io.get_ref();
+    while let Some(error) = inner {
+        if error.is::<rustls::Error>() {
+            return true;
+        }
+        inner = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref());
+    }
+    false
+}
+
+fn error_chain_message(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(err) = source {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+    message
 }
 
 /// Reqwest backend for cross-platform HTTP
