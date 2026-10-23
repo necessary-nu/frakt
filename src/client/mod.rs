@@ -461,8 +461,8 @@ impl Client {
             Backend::Foundation(foundation_backend) => {
                 // Use Foundation backend for WebSocket
                 crate::websocket::WebSocketBuilder::Foundation(
-                    crate::backend::foundation::FoundationWebSocketBuilder::new(
-                        foundation_backend.session().clone(),
+                    crate::backend::foundation::FoundationWebSocketBuilder::for_backend(
+                        foundation_backend,
                     ),
                 )
             }

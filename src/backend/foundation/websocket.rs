@@ -232,6 +232,9 @@ pub struct FoundationWebSocketBuilder {
     pub session: Retained<NSURLSession>,
     /// Maximum message size for the WebSocket connection
     pub max_message_size: Option<isize>,
+    /// Keeps a backend's session from being invalidated before the task is
+    /// created on it.
+    owner: Option<std::sync::Arc<super::Session>>,
 }
 
 impl FoundationWebSocketBuilder {
@@ -240,6 +243,15 @@ impl FoundationWebSocketBuilder {
         Self {
             session,
             max_message_size: None,
+            owner: None,
+        }
+    }
+
+    pub(crate) fn for_backend(backend: &super::FoundationBackend) -> Self {
+        Self {
+            session: backend.session().clone(),
+            max_message_size: None,
+            owner: Some(backend.session.clone()),
         }
     }
 
@@ -252,6 +264,7 @@ impl FoundationWebSocketBuilder {
     /// Connect to a WebSocket URL
     pub async fn connect(self, url: &str) -> Result<FoundationWebSocket> {
         let websocket = FoundationWebSocket::new(self.session, url).await?;
+        drop(self.owner);
 
         // Set maximum message size if specified
         if let Some(size) = self.max_message_size {

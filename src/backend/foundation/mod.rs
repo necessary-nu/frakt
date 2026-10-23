@@ -18,77 +18,84 @@ pub mod error;
 
 use crate::backend::types::{BackendRequest, BackendResponse};
 use crate::{Error, Result};
-use block2::StackBlock;
+use bytes::Bytes;
+use delegate::data_task::{DataTaskDelegate, DataTaskState, ResponseHead, header_value_string};
+use futures_util::Stream;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::runtime::Bool;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSHTTPURLResponse, NSMutableURLRequest, NSString, NSURL, NSURLSession};
-use std::ptr::NonNull;
-use tokio::sync::mpsc;
+use objc2_foundation::{
+    NSMutableURLRequest, NSString, NSURL, NSURLSession, NSURLSessionConfiguration,
+    NSURLSessionDataTask,
+};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::time::Sleep;
 use url::Url;
+
+/// NSURLSession's own idle timeout, set out of reach. It keeps running while
+/// a task is suspended for backpressure, so a slow consumer would trip it;
+/// FoundationBody enforces the read timeout instead.
+const NO_TIMEOUT: f64 = 365.0 * 24.0 * 60.0 * 60.0;
+
+/// An NSURLSession and its delegate. The session holds its delegate
+/// strongly until it is invalidated, so it is invalidated when the last
+/// backend clone or response body using it goes away.
+pub(crate) struct Session {
+    session: Retained<NSURLSession>,
+    delegate: Retained<DataTaskDelegate>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Lets tasks created from `FoundationBackend::session()` (WebSockets)
+        // run to completion.
+        self.session.finishTasksAndInvalidate();
+    }
+}
 
 /// Foundation backend using NSURLSession
 #[derive(Clone)]
 pub struct FoundationBackend {
-    session: Retained<NSURLSession>,
-    delegate: Retained<delegate::DataTaskDelegate>,
+    session: Arc<Session>,
     cookie_jar: Option<crate::CookieJar>,
     default_headers: Option<http::HeaderMap>,
-    total_timeout: Option<std::time::Duration>,
+    user_agent: Option<String>,
+    read_timeout: Option<Duration>,
+    total_timeout: Option<Duration>,
 }
 
 impl FoundationBackend {
     /// Create a new Foundation backend with default configuration
     pub fn new() -> Result<Self> {
-        // Create delegate and session with delegate
-        let delegate = delegate::DataTaskDelegate::new();
-        let session = unsafe {
-            NSURLSession::sessionWithConfiguration_delegate_delegateQueue(
-                &objc2_foundation::NSURLSessionConfiguration::defaultSessionConfiguration(),
-                Some(ProtocolObject::from_ref(&*delegate)),
-                None,
-            )
-        };
-
-        Ok(Self {
-            session,
-            delegate,
-            cookie_jar: None,
-            default_headers: None,
-            total_timeout: None,
-        })
+        Self::with_config(crate::backend::BackendConfig::default())
     }
 
-    /// Create a new Foundation backend with custom session configuration
+    /// Create a new Foundation backend around an existing session whose
+    /// delegate is `delegate`. The session is invalidated when the backend
+    /// is dropped.
     pub fn with_session(
         session: Retained<NSURLSession>,
-        delegate: Retained<delegate::DataTaskDelegate>,
+        delegate: Retained<DataTaskDelegate>,
     ) -> Self {
+        let config = crate::backend::BackendConfig::default();
         Self {
-            session,
-            delegate,
+            session: Arc::new(Session { session, delegate }),
             cookie_jar: None,
-            default_headers: None,
+            default_headers: config.default_headers,
+            user_agent: None,
+            read_timeout: config.read_timeout,
             total_timeout: None,
         }
     }
 
     /// Create a new Foundation backend with configuration
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
-        let delegate = delegate::DataTaskDelegate::new();
-
-        let session_config =
-            objc2_foundation::NSURLSessionConfiguration::defaultSessionConfiguration();
-
-        // Apply timeout configuration
-        if let Some(timeout) = config.read_timeout {
-            session_config.setTimeoutIntervalForRequest(timeout.as_secs_f64());
-        }
-
-        // Other configuration options like default headers are stored in the backend
-        // and applied to individual requests
-
+        let delegate = DataTaskDelegate::new(false, None);
+        let session_config = NSURLSessionConfiguration::defaultSessionConfiguration();
+        session_config.setTimeoutIntervalForRequest(NO_TIMEOUT);
         let session = unsafe {
             NSURLSession::sessionWithConfiguration_delegate_delegateQueue(
                 &session_config,
@@ -98,256 +105,114 @@ impl FoundationBackend {
         };
 
         Ok(Self {
-            session,
-            delegate,
+            session: Arc::new(Session { session, delegate }),
             cookie_jar: config.cookie_jar,
             default_headers: config.default_headers,
+            user_agent: None,
+            read_timeout: config.read_timeout,
             total_timeout: config.timeout,
         })
     }
 
-    pub(crate) fn total_timeout(&self) -> Option<std::time::Duration> {
+    pub(crate) fn total_timeout(&self) -> Option<Duration> {
         self.total_timeout
     }
 
     /// Get the underlying NSURLSession (for WebSocket support)
     pub fn session(&self) -> &Retained<NSURLSession> {
-        &self.session
+        &self.session.session
     }
 
     /// Execute an HTTP request using NSURLSession
     pub async fn execute(&self, request: BackendRequest) -> Result<BackendResponse> {
-        // Create NSURLRequest and validate URL
-        let nsurl = NSURL::URLWithString(&NSString::from_str(&request.url.as_str()))
+        let requested_url = request.url.clone();
+        // Dropping `body`, including dropping this future at the await,
+        // cancels the task.
+        let mut body = self.start(request)?;
+        let head = std::future::poll_fn(|cx| body.poll_head(cx)).await?;
+
+        Ok(BackendResponse {
+            status: head.status,
+            headers: head.headers,
+            url: head.url.unwrap_or(requested_url),
+            body: Box::pin(body),
+            redirect_headers: vec![],
+        })
+    }
+
+    /// Build and start the data task. Kept synchronous so that no
+    /// Objective-C object that is not Send lives across an await.
+    fn start(&self, request: BackendRequest) -> Result<FoundationBody> {
+        match request.url.scheme() {
+            "http" | "https" => {}
+            _ => return Err(Error::InvalidUrl),
+        }
+        let nsurl = NSURL::URLWithString(&NSString::from_str(request.url.as_str()))
             .ok_or(Error::InvalidUrl)?;
 
-        // Validate URL scheme using Foundation APIs
-        let scheme = nsurl.scheme();
-        if let Some(scheme_str) = scheme {
-            let scheme_string = scheme_str.to_string();
-            match scheme_string.as_str() {
-                "http" | "https" => {}
-                _ => {
-                    return Err(Error::InvalidUrl);
-                }
-            }
-        } else {
-            return Err(Error::InvalidUrl);
+        let nsrequest = NSMutableURLRequest::requestWithURL(&nsurl);
+        nsrequest.setHTTPMethod(&NSString::from_str(request.method.as_str()));
+        nsrequest.setTimeoutInterval(NO_TIMEOUT);
+
+        let mut headers = self.default_headers.clone().unwrap_or_default();
+        if let Some(user_agent) = &self.user_agent {
+            headers.insert(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_str(user_agent).map_err(|_| Error::InvalidHeader)?,
+            );
+        }
+        for name in request.headers.keys() {
+            headers.remove(name);
+        }
+        for (name, value) in &request.headers {
+            headers.append(name.clone(), value.clone());
         }
 
-        let nsrequest = {
-            let req = NSMutableURLRequest::requestWithURL(&nsurl);
-            req.setHTTPMethod(&NSString::from_str(request.method.as_str()));
-
-            // Set default headers first
-            if let Some(ref default_headers) = self.default_headers {
-                for (name, value) in default_headers {
-                    req.setValue_forHTTPHeaderField(
-                        Some(&NSString::from_str(
-                            value.to_str().expect("Invalid default header value"),
-                        )),
-                        &NSString::from_str(name.as_str()),
+        if let Some(body) = &request.body {
+            let (content_type, data) = encode_body(body)?;
+            if let Some(content_type) = content_type {
+                if !headers.contains_key(http::header::CONTENT_TYPE) {
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_str(&content_type)
+                            .map_err(|_| Error::InvalidHeader)?,
                     );
                 }
             }
-
-            // Set request headers (these can override default headers)
-            for (name, value) in &request.headers {
-                req.setValue_forHTTPHeaderField(
-                    Some(&NSString::from_str(
-                        value.to_str().expect("Invalid header value"),
-                    )),
-                    &NSString::from_str(name.as_str()),
-                );
+            if let Some(data) = data {
+                nsrequest.setHTTPBody(Some(&objc2_foundation::NSData::from_vec(data)));
             }
+        }
 
-            // Set body
-            if let Some(body) = &request.body {
-                match body {
-                    crate::body::Body::Empty => {}
-                    crate::body::Body::Bytes {
-                        content,
-                        content_type,
-                    } => {
-                        req.setValue_forHTTPHeaderField(
-                            Some(&NSString::from_str(content_type)),
-                            &NSString::from_str("Content-Type"),
-                        );
-                        let nsdata = objc2_foundation::NSData::from_vec(content.to_vec());
-                        req.setHTTPBody(Some(&nsdata));
-                    }
-                    crate::body::Body::Form { fields } => {
-                        req.setValue_forHTTPHeaderField(
-                            Some(&NSString::from_str("application/x-www-form-urlencoded")),
-                            &NSString::from_str("Content-Type"),
-                        );
-                        let encoded = encode_form_fields(fields);
-                        let nsdata = objc2_foundation::NSData::from_vec(encoded.into_bytes());
-                        req.setHTTPBody(Some(&nsdata));
-                    }
-                    crate::body::Body::Json { value } => {
-                        req.setValue_forHTTPHeaderField(
-                            Some(&NSString::from_str("application/json")),
-                            &NSString::from_str("Content-Type"),
-                        );
-                        let json_bytes =
-                            serde_json::to_vec(value).map_err(|e| Error::Json(e.to_string()))?;
-                        let nsdata = objc2_foundation::NSData::from_vec(json_bytes);
-                        req.setHTTPBody(Some(&nsdata));
-                    }
-                    crate::body::Body::Multipart { parts } => {
-                        let boundary = generate_boundary();
-                        let content_type = format!("multipart/form-data; boundary={}", boundary);
-                        req.setValue_forHTTPHeaderField(
-                            Some(&NSString::from_str(&content_type)),
-                            &NSString::from_str("Content-Type"),
-                        );
-                        let multipart_data = encode_multipart_data(&boundary, parts)?;
-                        let nsdata = objc2_foundation::NSData::from_vec(multipart_data);
-                        req.setHTTPBody(Some(&nsdata));
-                    }
+        for name in headers.keys() {
+            let field = NSString::from_str(name.as_str());
+            for (index, value) in headers.get_all(name).iter().enumerate() {
+                let value = header_value_string(value);
+                if index == 0 {
+                    nsrequest.setValue_forHTTPHeaderField(Some(&value), &field);
+                } else {
+                    nsrequest.addValue_forHTTPHeaderField(&value, &field);
                 }
             }
-
-            req
-        };
-
-        // Create task context with progress callback if present
-        let task_context = if let Some(progress_callback) = request.progress_callback {
-            std::sync::Arc::new(
-                delegate::shared_context::TaskSharedContext::with_progress_callback(
-                    progress_callback,
-                ),
-            )
-        } else {
-            std::sync::Arc::new(delegate::shared_context::TaskSharedContext::new())
-        };
-
-        // Create data task
-        let data_task = self.session.dataTaskWithRequest(&nsrequest);
-
-        // Register the task context with the delegate using the task identifier
-        let task_id = data_task.taskIdentifier() as usize;
-        self.delegate.register_task(task_id, task_context.clone());
-
-        // Create channel for response body
-        let (tx, rx) = mpsc::channel(32);
-
-        // Start task
-        data_task.resume();
-
-        // Wait for response headers
-        while !task_context.is_completed() && task_context.response.load_full().is_none() {
-            tokio::task::yield_now().await;
         }
 
-        // Check for errors
-        if let Some(error) = task_context.error.load_full() {
-            return Err(Error::from_ns_error(&*error));
-        }
+        let state = Arc::new(DataTaskState::new(request.progress_callback));
+        let task = self.session.session.dataTaskWithRequest(&nsrequest);
+        self.session
+            .delegate
+            .register(task.taskIdentifier() as usize, state.clone());
 
-        // Get response
-        let response = task_context
-            .response
-            .load_full()
-            .ok_or_else(|| Error::Internal("No response received".to_string()))?;
-
-        let status = {
-            // Try to cast to NSHTTPURLResponse to get status code
-            let http_response: Option<&NSHTTPURLResponse> = response.as_ref().downcast_ref();
-            if let Some(http_response) = http_response {
-                http_response.statusCode() as u16
-            } else {
-                200
-            }
+        let body = FoundationBody {
+            state,
+            task,
+            _session: self.session.clone(),
+            finished: false,
+            read_timeout: request.read_timeout.or(self.read_timeout),
+            idle: None,
+            waiting_since: None,
         };
-        let status_code = http::StatusCode::from_u16(status as u16).unwrap_or(http::StatusCode::OK);
-
-        // Extract headers from NSHTTPURLResponse
-        let mut headers = http::HeaderMap::new();
-
-        unsafe {
-            if let Some(http_response) = response.as_ref().downcast_ref::<NSHTTPURLResponse>() {
-                let all_headers = http_response.allHeaderFields();
-
-                use std::cell::RefCell;
-                use std::sync::Arc;
-
-                let headers_cell = Arc::new(RefCell::new(http::HeaderMap::new()));
-                let headers_cell_clone = headers_cell.clone();
-
-                let closure = move |key: NonNull<AnyObject>,
-                                    value: NonNull<AnyObject>,
-                                    _stop: NonNull<Bool>| {
-                    // Cast to NSString
-                    if let Some(key_nsstring) = key.as_ref().downcast_ref::<NSString>() {
-                        if let Some(value_nsstring) = value.as_ref().downcast_ref::<NSString>() {
-                            let key_str = key_nsstring.to_string();
-                            let value_str = value_nsstring.to_string();
-
-                            // Convert to http types and insert
-                            if let (Ok(header_name), Ok(header_value)) = (
-                                http::HeaderName::from_bytes(key_str.as_bytes()),
-                                http::HeaderValue::from_str(&value_str),
-                            ) {
-                                headers_cell_clone
-                                    .borrow_mut()
-                                    .insert(header_name, header_value);
-                            }
-                        }
-                    }
-                };
-
-                // Transform FnMut to Fn using RefCell
-                let block = StackBlock::new(
-                    move |key: NonNull<AnyObject>,
-                          value: NonNull<AnyObject>,
-                          stop: NonNull<Bool>| { closure(key, value, stop) },
-                );
-
-                // Call enumerateKeysAndObjectsUsingBlock
-                let _: () =
-                    objc2::msg_send![&*all_headers, enumerateKeysAndObjectsUsingBlock: &*block];
-                drop(block);
-
-                // Extract the final headers
-                headers = Arc::try_unwrap(headers_cell)
-                    .unwrap_or_else(|_| panic!("Headers RefCell still has references"))
-                    .into_inner();
-            }
-        }
-
-        // Spawn task to read body data
-        let body_context = task_context.clone();
-        tokio::spawn(async move {
-            while !body_context.is_completed() {
-                let data = body_context.response_buffer.lock().await.clone();
-                if !data.is_empty() {
-                    let bytes = bytes::Bytes::from(data);
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        break;
-                    }
-                    // Clear the buffer
-                    body_context.response_buffer.lock().await.clear();
-                }
-                tokio::task::yield_now().await;
-            }
-
-            // Send any remaining data when task completes
-            let final_data = body_context.response_buffer.lock().await.clone();
-            if !final_data.is_empty() {
-                let bytes = bytes::Bytes::from(final_data);
-                let _ = tx.send(Ok(bytes)).await;
-            }
-        });
-
-        Ok(BackendResponse {
-            status: status_code,
-            headers,
-            url: request.url,
-            body: crate::backend::types::channel_body(rx),
-            redirect_headers: vec![],
-        })
+        body.task.resume();
+        Ok(body)
     }
 
     /// Execute a background download
@@ -401,12 +266,9 @@ impl FoundationBackend {
         let nsrequest = {
             let req = NSMutableURLRequest::requestWithURL(&nsurl);
 
-            // Set headers
             for (name, value) in &headers {
-                req.setValue_forHTTPHeaderField(
-                    Some(&NSString::from_str(
-                        value.to_str().expect("Invalid header value"),
-                    )),
+                req.addValue_forHTTPHeaderField(
+                    &header_value_string(value),
                     &NSString::from_str(name.as_str()),
                 );
             }
@@ -466,6 +328,116 @@ impl FoundationBackend {
     pub fn cookie_jar(&self) -> Option<&crate::CookieJar> {
         self.cookie_jar.as_ref()
     }
+}
+
+/// A response body read from a data task. Dropping it before the end
+/// cancels the task, which closes its connection.
+struct FoundationBody {
+    state: Arc<DataTaskState>,
+    task: Retained<NSURLSessionDataTask>,
+    _session: Arc<Session>,
+    finished: bool,
+    read_timeout: Option<Duration>,
+    idle: Option<Pin<Box<Sleep>>>,
+    /// When the owner started waiting for the current head or chunk.
+    waiting_since: Option<Instant>,
+}
+
+impl FoundationBody {
+    fn poll_head(&mut self, cx: &mut Context<'_>) -> Poll<Result<ResponseHead>> {
+        match self.state.poll_head(cx) {
+            Poll::Ready(result) => {
+                self.waiting_since = None;
+                if result.is_err() {
+                    self.finished = true;
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => self.poll_read_timeout(cx).map(Err),
+        }
+    }
+
+    /// Fails with a timeout once the network has been idle for the read
+    /// timeout while the owner was waiting. The task is never suspended
+    /// while the owner waits (it is resumed before the queue drains), so
+    /// this only counts time spent waiting on the network.
+    fn poll_read_timeout(&mut self, cx: &mut Context<'_>) -> Poll<Error> {
+        let Some(timeout) = self.read_timeout else {
+            return Poll::Pending;
+        };
+        let waiting_since = *self.waiting_since.get_or_insert_with(Instant::now);
+        loop {
+            let deadline = waiting_since.max(self.state.last_activity()) + timeout;
+            if Instant::now() >= deadline {
+                self.finished = true;
+                self.task.cancel();
+                self.state.discard();
+                return Poll::Ready(Error::Timeout);
+            }
+            let idle = self
+                .idle
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline.into())));
+            idle.as_mut().reset(deadline.into());
+            if idle.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+impl Stream for FoundationBody {
+    type Item = Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        match self.state.poll_chunk(&self.task, cx) {
+            Poll::Ready(item) => {
+                self.waiting_since = None;
+                if matches!(item, None | Some(Err(_))) {
+                    self.finished = true;
+                }
+                Poll::Ready(item)
+            }
+            Poll::Pending => self.poll_read_timeout(cx).map(|error| Some(Err(error))),
+        }
+    }
+}
+
+impl Drop for FoundationBody {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.task.cancel();
+            self.state.discard();
+        }
+    }
+}
+
+/// The Content-Type a body implies and its encoded bytes.
+fn encode_body(body: &crate::body::Body) -> Result<(Option<String>, Option<Vec<u8>>)> {
+    Ok(match body {
+        crate::body::Body::Empty => (None, None),
+        crate::body::Body::Bytes {
+            content,
+            content_type,
+        } => (Some(content_type.clone()), Some(content.to_vec())),
+        crate::body::Body::Form { fields } => (
+            Some("application/x-www-form-urlencoded".to_string()),
+            Some(encode_form_fields(fields).into_bytes()),
+        ),
+        crate::body::Body::Json { value } => (
+            Some("application/json".to_string()),
+            Some(serde_json::to_vec(value).map_err(|e| Error::Json(e.to_string()))?),
+        ),
+        crate::body::Body::Multipart { parts } => {
+            let boundary = generate_boundary();
+            (
+                Some(format!("multipart/form-data; boundary={}", boundary)),
+                Some(encode_multipart_data(&boundary, parts)?),
+            )
+        }
+    })
 }
 
 fn encode_form_fields(

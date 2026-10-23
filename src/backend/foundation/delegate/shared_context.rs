@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwapOption;
 use objc2::rc::Retained;
 use objc2_foundation::{NSError, NSURL};
-use tokio::sync::Mutex;
 
 use super::GenericWaker;
 
@@ -54,10 +53,6 @@ pub struct TaskSharedContext {
     pub completed: AtomicBool,
     /// Any error that occurred
     pub error: ArcSwapOption<Retained<NSError>>,
-    /// Response buffer
-    pub response_buffer: Arc<Mutex<Vec<u8>>>,
-    /// Maximum response buffer size
-    pub max_response_buffer_size: Arc<AtomicU64>,
     /// Bytes downloaded so far
     pub bytes_downloaded: AtomicU64,
     /// Total bytes expected (if known)
@@ -76,8 +71,6 @@ impl TaskSharedContext {
             waker: GenericWaker::new(),
             completed: AtomicBool::new(false),
             error: ArcSwapOption::new(None),
-            response_buffer: Arc::new(Mutex::new(Vec::new())),
-            max_response_buffer_size: Arc::new(AtomicU64::new(u64::MAX)),
             bytes_downloaded: AtomicU64::new(0),
             total_bytes_expected: AtomicU64::new(0),
             progress_callback: None,
@@ -92,8 +85,6 @@ impl TaskSharedContext {
             waker: GenericWaker::new(),
             completed: AtomicBool::new(false),
             error: ArcSwapOption::new(None),
-            response_buffer: Arc::new(Mutex::new(Vec::new())),
-            max_response_buffer_size: Arc::new(AtomicU64::new(u64::MAX)),
             bytes_downloaded: AtomicU64::new(0),
             total_bytes_expected: AtomicU64::new(0),
             progress_callback: Some(callback),
@@ -111,8 +102,6 @@ impl TaskSharedContext {
             waker: GenericWaker::new(),
             completed: AtomicBool::new(false),
             error: ArcSwapOption::new(None),
-            response_buffer: Arc::new(Mutex::new(Vec::new())),
-            max_response_buffer_size: Arc::new(AtomicU64::new(u64::MAX)),
             bytes_downloaded: AtomicU64::new(0),
             total_bytes_expected: AtomicU64::new(0),
             progress_callback,
@@ -135,30 +124,6 @@ impl TaskSharedContext {
     pub fn set_error(&self, error: Retained<NSError>) {
         self.error.store(Some(Arc::new(error)));
         self.mark_completed();
-    }
-
-    /// Take the response buffer
-    pub async fn take_response_buffer(&self) -> crate::Result<Vec<u8>> {
-        let mut buffer = self.response_buffer.lock().await;
-        Ok(std::mem::take(&mut *buffer))
-    }
-
-    /// Append data to response buffer
-    pub async fn append_data(&self, data: &[u8]) -> crate::Result<()> {
-        let max_size = self.max_response_buffer_size.load(Ordering::Acquire);
-        let mut buffer = self.response_buffer.lock().await;
-
-        if buffer.len() as u64 + data.len() as u64 > max_size {
-            return Err(crate::Error::ResponseTooLarge);
-        }
-
-        buffer.extend_from_slice(data);
-        Ok(())
-    }
-
-    /// Set maximum response buffer size
-    pub fn set_max_response_buffer_size(&self, size: u64) {
-        self.max_response_buffer_size.store(size, Ordering::Release);
     }
 
     /// Set the total bytes expected for this download
