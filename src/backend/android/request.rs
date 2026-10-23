@@ -299,6 +299,15 @@ fn start_request(
         .map_err(|e| Error::Internal(format!("setHttpMethod: {}", e)))?;
     for (name, value) in &request.headers {
         let value = header_value_string(value);
+        if name == http::header::ACCEPT_ENCODING {
+            let forced = builder
+                .force_header(name.as_str(), &value)
+                .map_err(|e| Error::Internal(format!("Accept-Encoding: {}", e)))?;
+            if !forced {
+                tracing::debug!("Cronet ignores Accept-Encoding: {}", value);
+            }
+            continue;
+        }
         builder
             .add_header(name.as_str(), &value)
             .map_err(|e| Error::Internal(format!("addHeader({}): {}", name, e)))?;

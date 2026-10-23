@@ -55,6 +55,46 @@ impl<'a, 'e> UrlRequestBuilder<'a, 'e> {
         Ok(self)
     }
 
+    /// Add a header that `addHeader` would refuse.
+    ///
+    /// Cronet's `addHeader` silently drops `Accept-Encoding`
+    /// (crbug.com/581399) and always asks for compressed bodies, which it then
+    /// decodes, so `Content-Length` and `Content-Range` no longer describe the
+    /// bytes delivered. This appends to the builder's private header list
+    /// instead; Chromium only adds its own `Accept-Encoding` when none is set.
+    /// Returns `Ok(false)`, leaving Cronet's default, if the Cronet
+    /// implementation has no such list.
+    pub fn force_header(&mut self, name: &str, value: &str) -> Result<bool, jni::errors::Error> {
+        let headers =
+            match self
+                .env
+                .get_field(&self.builder, "mRequestHeaders", "Ljava/util/ArrayList;")
+            {
+                Ok(headers) => headers.l()?,
+                Err(_) => {
+                    self.env.exception_clear()?;
+                    return Ok(false);
+                }
+            };
+        if headers.is_null() {
+            return Ok(false);
+        }
+        let name = self.env.new_string(name)?;
+        let value = self.env.new_string(value)?;
+        let entry = self.env.new_object(
+            "java/util/AbstractMap$SimpleEntry",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[JValue::Object(&name), JValue::Object(&value)],
+        )?;
+        self.env.call_method(
+            &headers,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&entry)],
+        )?;
+        Ok(true)
+    }
+
     pub fn set_upload_data_provider(
         &mut self,
         provider: &JObject,
