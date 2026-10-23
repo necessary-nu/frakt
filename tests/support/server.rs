@@ -573,8 +573,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     stream.shutdown().await
 }
 
-/// `/bytes?len=&seed=&chunk=&track=&etag=`: a generated body with ETag,
-/// Last-Modified and byte-range support (`Range` with optional `If-Range`).
+/// `/bytes?len=&seed=&chunk=&track=&etag=&rate=`: a generated body with ETag,
+/// Last-Modified and byte-range support (`Range` with optional `If-Range`),
+/// sent at no more than `rate` bytes per second if given.
 async fn serve_bytes<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request: &Request,
@@ -585,6 +586,7 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
     let chunk: usize = request.q("chunk", 64 * 1024);
     let etag = request.q("etag", etag(seed, len));
     let track = request.query.get("track").map(|id| state.track(id));
+    let rate: Option<f64> = request.query.get("rate").and_then(|r| r.parse().ok());
 
     let validator_matches = match request.header_str("if-range") {
         None => true,
@@ -645,7 +647,12 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
 
     let mut buf = vec![0u8; chunk];
     let mut pos = start;
+    let started = tokio::time::Instant::now();
     while pos < end {
+        if let Some(rate) = rate {
+            let due = started + Duration::from_secs_f64((pos - start) as f64 / rate);
+            tokio::time::sleep_until(due).await;
+        }
         let n = ((end - pos) as usize).min(buf.len());
         fill(seed, pos, &mut buf[..n]);
         if let Err(e) = stream.write_all(&buf[..n]).await {
