@@ -9,6 +9,16 @@
 //!
 //! Tests take a process-wide lock so that memory and timing measurements are
 //! not disturbed by other tests.
+//!
+//! On Android the suite is compiled into the library and run by vampire
+//! (`vampire test --test transfers::android::<name>`), which builds with the
+//! default features, so add `backend-android` to them for the run. The
+//! vampire host runs
+//! tests on its main thread during app startup, which Android kills after
+//! about 15 seconds, so run tests one at a time. A headless emulator also
+//! needs `dumpsys deviceidle disable` and
+//! `settings put global hidden_api_policy 1`, or the app loses network
+//! access when the device idles and cannot permit cleartext HTTP.
 
 #[path = "support/server.rs"]
 mod server;
@@ -31,10 +41,40 @@ fn client(backend: BackendType) -> Client {
     client_with(backend, |builder| builder)
 }
 
+/// The vampire host app targets an SDK that blocks cleartext HTTP by default,
+/// and the test server is plain HTTP on 127.0.0.1. The setter is a hidden
+/// API.
+#[cfg(all(target_os = "android", vampire))]
+fn permit_cleartext() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let vm = unsafe { jni::JavaVM::from_raw(vampire::java_vm() as *mut _) }.unwrap();
+        let mut env = vm.attach_current_thread_as_daemon().unwrap();
+        let policy = env
+            .call_static_method(
+                "android/security/NetworkSecurityPolicy",
+                "getInstance",
+                "()Landroid/security/NetworkSecurityPolicy;",
+                &[],
+            )
+            .and_then(|v| v.l())
+            .unwrap();
+        env.call_method(
+            &policy,
+            "setCleartextTrafficPermitted",
+            "(Z)V",
+            &[true.into()],
+        )
+        .unwrap();
+    });
+}
+
 fn client_with(
     backend: BackendType,
     configure: impl FnOnce(ClientBuilder) -> ClientBuilder,
 ) -> Client {
+    #[cfg(all(target_os = "android", vampire))]
+    permit_cleartext();
     configure(Client::builder().backend(backend))
         .build()
         .expect("client")
@@ -810,6 +850,8 @@ async fn progress_callbacks(backend: BackendType) {
 macro_rules! backend_suite {
     ($module:ident, $backend:expr) => {
         mod $module {
+            use super::BackendType;
+
             backend_suite!(@tests $backend;
                 large_body_is_byte_exact,
                 slow_consumer_gets_every_byte_with_bounded_buffering,
@@ -841,13 +883,13 @@ macro_rules! backend_suite {
 }
 
 #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
-backend_suite!(foundation, frakt::BackendType::Foundation);
+backend_suite!(foundation, BackendType::Foundation);
 
 #[cfg(feature = "backend-reqwest")]
-backend_suite!(reqwest, frakt::BackendType::Reqwest);
+backend_suite!(reqwest, BackendType::Reqwest);
 
 #[cfg(all(feature = "backend-winhttp", windows))]
-backend_suite!(winhttp, frakt::BackendType::Windows);
+backend_suite!(winhttp, BackendType::Windows);
 
 #[cfg(all(feature = "backend-android", target_os = "android"))]
-backend_suite!(android, frakt::BackendType::Android);
+backend_suite!(android, BackendType::Android);

@@ -266,4 +266,7 @@ pub use vampire::JNI_OnLoad;
 mod android_tests {
     #[path = "integration_tests.rs"]
     mod integration_tests;
+
+    #[path = "transfers.rs"]
+    mod transfers;
 }
