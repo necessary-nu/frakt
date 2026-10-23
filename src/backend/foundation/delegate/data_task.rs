@@ -2,7 +2,7 @@
 //!
 //! NSURLSession calls the delegate on its own serial operation queue, never
 //! on a thread the caller owns, so the delegate only records what happened in
-//! a [`DataTaskState`] and wakes whoever is waiting on it.
+//! a `DataTaskState` and wakes whoever is waiting on it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -191,7 +191,7 @@ pub struct DataTaskDelegateIvars {
 }
 
 define_class!(
-    /// NSURLSessionDataDelegate that feeds each task's [`DataTaskState`].
+    /// NSURLSessionDataDelegate that feeds each task's `DataTaskState`.
     #[unsafe(super = NSObject)]
     #[ivars = DataTaskDelegateIvars]
     pub struct DataTaskDelegate;
