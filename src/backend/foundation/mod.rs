@@ -236,7 +236,7 @@ impl FoundationBackend {
         let task = self.session.session.dataTaskWithRequest(&nsrequest);
         self.session
             .delegate
-            .register(task.taskIdentifier() as usize, state.clone());
+            .register(task.taskIdentifier(), state.clone());
 
         let body = FoundationBody {
             state,

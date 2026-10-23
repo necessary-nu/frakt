@@ -208,7 +208,7 @@ define_class!(
             task: &NSURLSessionTask,
             error: Option<&NSError>,
         ) {
-            if let Some(state) = self.take(task.taskIdentifier() as usize) {
+            if let Some(state) = self.take(task.taskIdentifier()) {
                 state.on_complete(match error {
                     Some(error) => Err(Error::from_ns_error(error)),
                     None => Ok(()),
@@ -247,7 +247,7 @@ define_class!(
             total_bytes_sent: i64,
             total_bytes_expected_to_send: i64,
         ) {
-            if let Some(state) = self.get(task.taskIdentifier() as usize) {
+            if let Some(state) = self.get(task.taskIdentifier()) {
                 state.on_send_progress();
                 if let Some(progress) = &state.progress {
                     let total = u64::try_from(total_bytes_expected_to_send)
@@ -268,7 +268,7 @@ define_class!(
             response: &NSURLResponse,
             completion_handler: &DynBlock<dyn Fn(NSURLSessionResponseDisposition)>,
         ) {
-            if let Some(state) = self.get(data_task.taskIdentifier() as usize) {
+            if let Some(state) = self.get(data_task.taskIdentifier()) {
                 state.on_response(response_head(response));
             }
             completion_handler.call((NSURLSessionResponseDisposition::Allow,));
@@ -281,7 +281,7 @@ define_class!(
             data_task: &NSURLSessionDataTask,
             data: &NSData,
         ) {
-            if let Some(state) = self.get(data_task.taskIdentifier() as usize) {
+            if let Some(state) = self.get(data_task.taskIdentifier()) {
                 state.on_data(data_task, Bytes::from(data.to_vec()));
             }
         }
