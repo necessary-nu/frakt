@@ -470,14 +470,22 @@ impl Client {
             Backend::Windows(_) => crate::websocket::WebSocketBuilder::Windows(
                 crate::backend::windows::WindowsWebSocketBuilder::new(),
             ),
-            #[cfg(all(feature = "backend-android", target_os = "android"))]
-            Backend::Android(_) => {
-                // Android backend uses reqwest for WebSocket (tokio-tungstenite)
-                // Cronet doesn't have built-in WebSocket support
-                crate::websocket::WebSocketBuilder::Reqwest(
-                    crate::backend::reqwest::ReqwestWebSocketBuilder::new(),
-                )
-            }
+            // Cronet has no WebSocket support; tokio-tungstenite is used when
+            // the reqwest backend is compiled in.
+            #[cfg(all(
+                feature = "backend-android",
+                target_os = "android",
+                feature = "backend-reqwest"
+            ))]
+            Backend::Android(_) => crate::websocket::WebSocketBuilder::Reqwest(
+                crate::backend::reqwest::ReqwestWebSocketBuilder::new(),
+            ),
+            #[cfg(all(
+                feature = "backend-android",
+                target_os = "android",
+                not(feature = "backend-reqwest")
+            ))]
+            Backend::Android(_) => crate::websocket::WebSocketBuilder::Unsupported,
             #[cfg(feature = "backend-reqwest")]
             Backend::Reqwest(_) => {
                 // Use Reqwest backend for WebSocket with tokio-tungstenite
@@ -589,37 +597,26 @@ pub enum BackendType {
 }
 
 impl BackendType {
-    /// Get the default backend type for the current platform
+    /// The default backend type for the current target, or `None` if no
+    /// backend usable on this target is enabled.
+    ///
+    /// The native stack is preferred when its feature is enabled; reqwest is
+    /// the fallback.
     #[allow(unreachable_code)]
-    pub fn fallback() -> Self {
-        // Apple platforms use Foundation by default
+    pub fn fallback() -> Option<Self> {
         #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
-        {
-            return BackendType::Foundation;
-        }
+        return Some(BackendType::Foundation);
 
-        // Windows uses winhttp if available
         #[cfg(all(feature = "backend-winhttp", windows))]
-        {
-            return BackendType::Windows;
-        }
+        return Some(BackendType::Windows);
 
-        // Android uses Android backend if available
         #[cfg(all(feature = "backend-android", target_os = "android"))]
-        {
-            return BackendType::Android;
-        }
+        return Some(BackendType::Android);
 
-        // Fallback to Reqwest on other platforms
         #[cfg(feature = "backend-reqwest")]
-        {
-            return BackendType::Reqwest;
-        }
+        return Some(BackendType::Reqwest);
 
-        #[allow(unreachable_code)]
-        {
-            unreachable!("No backend available")
-        }
+        None
     }
 }
 
@@ -742,23 +739,16 @@ impl ClientBuilder {
     }
 
     /// Build the client with the configured settings
-    pub fn build(mut self) -> crate::Result<Client> {
-        let backend = match self.backend_type {
-            #[cfg(feature = "backend-reqwest")]
-            Some(BackendType::Reqwest) => Backend::reqwest_with_config(self.config)?,
-            #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
-            Some(BackendType::Foundation) => Backend::foundation_with_config(self.config)?,
-            #[cfg(all(feature = "backend-winhttp", windows))]
-            Some(BackendType::Windows) => Backend::windows_with_config(self.config)?,
-            #[cfg(all(feature = "backend-android", target_os = "android"))]
-            Some(BackendType::Android) => Backend::android_with_config(self.config)?,
-            None => {
-                self.backend_type = Some(BackendType::fallback());
-                return self.build();
-            }
+    pub fn build(self) -> crate::Result<Client> {
+        let backend_type = match self.backend_type {
+            Some(backend_type) => backend_type,
+            None => BackendType::fallback().ok_or_else(|| {
+                crate::Error::Internal("No HTTP backend is enabled for this target".to_string())
+            })?,
         };
-
-        Ok(Client { backend })
+        Ok(Client {
+            backend: Backend::with_config(backend_type, self.config)?,
+        })
     }
 }
 

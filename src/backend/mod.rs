@@ -28,6 +28,10 @@ use std::time::Duration;
 use types::{BackendRequest, BackendResponse};
 use url::Url;
 
+fn no_backend_error() -> Error {
+    Error::Internal("No HTTP backend is enabled for this target".to_string())
+}
+
 /// Configuration for backend creation
 #[derive(Clone, Debug, Default)]
 pub struct BackendConfig {
@@ -73,36 +77,36 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// Auto-select best backend for platform
+    /// Auto-select the best backend compiled in for this target.
+    ///
+    /// The native stack is preferred (Foundation on Apple targets, WinHTTP on
+    /// Windows, Cronet on Android) when its feature is enabled; otherwise
+    /// reqwest is used if `backend-reqwest` is enabled.
     pub fn default_for_platform() -> Result<Self> {
-        #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
-        {
-            // Default to Foundation on Apple platforms
-            return Ok(Backend::Foundation(foundation::FoundationBackend::new()?));
-        }
+        Self::with_config(
+            crate::client::BackendType::fallback().ok_or_else(no_backend_error)?,
+            BackendConfig::default(),
+        )
+    }
 
-        #[cfg(all(windows, not(target_vendor = "apple")))]
-        {
-            // Default to Windows on Windows platforms
-            return Ok(Backend::Windows(windows::WindowsBackend::new()?));
+    /// Create the given backend type with configuration.
+    pub fn with_config(
+        backend_type: crate::client::BackendType,
+        config: BackendConfig,
+    ) -> Result<Self> {
+        use crate::client::BackendType;
+        match backend_type {
+            #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
+            BackendType::Foundation => Self::foundation_with_config(config),
+            #[cfg(all(feature = "backend-winhttp", windows))]
+            BackendType::Windows => Self::windows_with_config(config),
+            #[cfg(all(feature = "backend-android", target_os = "android"))]
+            BackendType::Android => Self::android_with_config(config),
+            #[cfg(feature = "backend-reqwest")]
+            BackendType::Reqwest => Self::reqwest_with_config(config),
+            #[allow(unreachable_patterns)]
+            _ => Err(no_backend_error()),
         }
-
-        #[cfg(all(target_os = "android", not(any(target_vendor = "apple", windows))))]
-        {
-            // Default to Android backend on Android
-            return Ok(Backend::Android(android::AndroidBackend::new()?));
-        }
-
-        #[cfg(not(any(target_vendor = "apple", windows, target_os = "android")))]
-        {
-            // Use reqwest everywhere else
-            return Ok(Backend::Reqwest(reqwest::ReqwestBackend::new()?));
-        }
-
-        #[allow(unreachable_code)]
-        Err(Error::Internal(
-            "No suitable backend available for this platform".to_string(),
-        ))
     }
 
     /// Explicitly use reqwest backend (works on all platforms)

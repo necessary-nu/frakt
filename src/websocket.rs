@@ -1,6 +1,6 @@
 //! WebSocket support with backend abstraction
 
-use crate::Result;
+use crate::{Error, Result};
 
 // Backend-specific implementations are in their respective modules
 
@@ -466,6 +466,9 @@ pub enum WebSocketBuilder {
     /// Reqwest backend using tokio-tungstenite
     #[cfg(feature = "backend-reqwest")]
     Reqwest(crate::backend::reqwest::ReqwestWebSocketBuilder),
+    /// The client's backend has no WebSocket implementation in this build;
+    /// connecting fails with an error.
+    Unsupported,
 }
 
 impl WebSocketBuilder {
@@ -508,8 +511,7 @@ impl WebSocketBuilder {
             WebSocketBuilder::Reqwest(builder) => {
                 WebSocketBuilder::Reqwest(builder.maximum_message_size(size))
             }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("No backend available"),
+            WebSocketBuilder::Unsupported => WebSocketBuilder::Unsupported,
         }
     }
 
@@ -557,8 +559,12 @@ impl WebSocketBuilder {
                 let ws = builder.connect(url).await?;
                 Ok(WebSocket::Reqwest(ws))
             }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("No backend available"),
+            WebSocketBuilder::Unsupported => {
+                let _ = url;
+                Err(Error::Internal(
+                    "WebSockets are not supported by this backend".to_string(),
+                ))
+            }
         }
     }
 }
