@@ -44,7 +44,7 @@ fn client(backend: BackendType) -> Client {
 /// The vampire host app targets an SDK that blocks cleartext HTTP by default,
 /// and the test server is plain HTTP on 127.0.0.1. The setter is a hidden
 /// API.
-#[cfg(all(target_os = "android", vampire))]
+#[cfg(all(target_os = "android", vampire, feature = "backend-android"))]
 fn permit_cleartext() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -73,7 +73,7 @@ fn client_with(
     backend: BackendType,
     configure: impl FnOnce(ClientBuilder) -> ClientBuilder,
 ) -> Client {
-    #[cfg(all(target_os = "android", vampire))]
+    #[cfg(all(target_os = "android", vampire, feature = "backend-android"))]
     permit_cleartext();
     configure(Client::builder().backend(backend))
         .build()
