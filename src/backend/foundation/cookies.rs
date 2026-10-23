@@ -91,6 +91,10 @@ impl Cookie {
 }
 
 impl FoundationCookieStorage {
+    pub(crate) fn ns_storage(&self) -> &NSHTTPCookieStorage {
+        &self.storage
+    }
+
     /// Create a new cookie storage with shared storage
     pub fn new() -> Self {
         Self {

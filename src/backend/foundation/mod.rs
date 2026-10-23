@@ -22,9 +22,10 @@ use bytes::Bytes;
 use delegate::data_task::{DataTaskDelegate, DataTaskState, ResponseHead, header_value_string};
 use futures_util::Stream;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_foundation::{
-    NSMutableURLRequest, NSString, NSURL, NSURLSession, NSURLSessionConfiguration,
+    NSCopying, NSDictionary, NSHTTPCookieAcceptPolicy, NSMutableDictionary, NSMutableURLRequest,
+    NSNumber, NSString, NSURL, NSURLRequestCachePolicy, NSURLSession, NSURLSessionConfiguration,
     NSURLSessionDataTask,
 };
 use std::future::Future;
@@ -91,11 +92,46 @@ impl FoundationBackend {
         }
     }
 
-    /// Create a new Foundation backend with configuration
+    /// Create a new Foundation backend with configuration.
+    ///
+    /// The session is ephemeral (nothing is written to disk) and has no URL
+    /// cache, so every request reaches the server, as on the other backends.
+    /// Proxies and server trust follow the system settings unless
+    /// overridden. Cookies are off unless `use_cookies` is set or a cookie
+    /// jar is given.
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
-        let delegate = DataTaskDelegate::new(false, None);
-        let session_config = NSURLSessionConfiguration::defaultSessionConfiguration();
+        let proxy_credentials = [&config.socks_proxy, &config.https_proxy, &config.http_proxy]
+            .into_iter()
+            .flatten()
+            .find_map(|proxy| Some((proxy.username.clone()?, proxy.password.clone()?)));
+        let delegate = DataTaskDelegate::new(
+            config.ignore_certificate_errors.unwrap_or(false),
+            proxy_credentials,
+        );
+
+        let session_config = NSURLSessionConfiguration::ephemeralSessionConfiguration();
+        session_config.setURLCache(None);
+        session_config.setRequestCachePolicy(NSURLRequestCachePolicy::ReloadIgnoringLocalCacheData);
         session_config.setTimeoutIntervalForRequest(NO_TIMEOUT);
+
+        let cookie_storage = config
+            .cookie_jar
+            .as_ref()
+            .and_then(|jar| jar.foundation_storage());
+        if config.use_cookies == Some(true) || cookie_storage.is_some() {
+            if let Some(storage) = cookie_storage {
+                session_config.setHTTPCookieStorage(Some(storage.ns_storage()));
+            }
+        } else {
+            session_config.setHTTPShouldSetCookies(false);
+            session_config.setHTTPCookieAcceptPolicy(NSHTTPCookieAcceptPolicy::Never);
+            session_config.setHTTPCookieStorage(None);
+        }
+
+        if let Some(proxies) = proxy_dictionary(&config) {
+            unsafe { session_config.setConnectionProxyDictionary(Some(&proxies)) };
+        }
+
         let session = unsafe {
             NSURLSession::sessionWithConfiguration_delegate_delegateQueue(
                 &session_config,
@@ -108,7 +144,7 @@ impl FoundationBackend {
             session: Arc::new(Session { session, delegate }),
             cookie_jar: config.cookie_jar,
             default_headers: config.default_headers,
-            user_agent: None,
+            user_agent: config.user_agent,
             read_timeout: config.read_timeout,
             total_timeout: config.timeout,
         })
@@ -438,6 +474,36 @@ fn encode_body(body: &crate::body::Body) -> Result<(Option<String>, Option<Vec<u
             )
         }
     })
+}
+
+/// `connectionProxyDictionary` for explicitly configured proxies, or `None`
+/// to use the system's proxy settings (including PAC and WPAD).
+fn proxy_dictionary(config: &crate::backend::BackendConfig) -> Option<Retained<NSDictionary>> {
+    let proxies = [
+        ("HTTP", &config.http_proxy),
+        ("HTTPS", &config.https_proxy),
+        ("SOCKS", &config.socks_proxy),
+    ];
+    if proxies.iter().all(|(_, proxy)| proxy.is_none()) {
+        return None;
+    }
+
+    let dict: Retained<NSMutableDictionary<ProtocolObject<dyn NSCopying>, AnyObject>> =
+        NSMutableDictionary::new();
+    let set = |key: String, value: &AnyObject| unsafe {
+        dict.setObject_forKey(value, ProtocolObject::from_ref(&*NSString::from_str(&key)));
+    };
+    for (prefix, proxy) in proxies {
+        if let Some(proxy) = proxy {
+            set(format!("{}Enable", prefix), &NSNumber::new_bool(true));
+            set(format!("{}Proxy", prefix), &NSString::from_str(&proxy.host));
+            set(
+                format!("{}Port", prefix),
+                &NSNumber::new_i32(i32::from(proxy.port)),
+            );
+        }
+    }
+    Some(unsafe { Retained::cast_unchecked(dict) })
 }
 
 fn encode_form_fields(

@@ -84,6 +84,17 @@ pub struct CookieJar {
 }
 
 impl CookieJar {
+    #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
+    pub(crate) fn foundation_storage(
+        &self,
+    ) -> Option<&crate::backend::foundation::FoundationCookieStorage> {
+        match &self.storage {
+            CookieStorage::Foundation(storage) => Some(storage),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// Create a new cookie jar with default storage.
     ///
     /// This creates a cookie jar using the appropriate backend for the platform.
