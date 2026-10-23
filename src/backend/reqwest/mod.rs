@@ -119,6 +119,15 @@ impl Stream for ReqwestBody {
     }
 }
 
+fn body_content_type(body: &crate::body::Body) -> Option<&str> {
+    match body {
+        crate::body::Body::Bytes { content_type, .. } => Some(content_type),
+        crate::body::Body::Form { .. } => Some("application/x-www-form-urlencoded"),
+        crate::body::Body::Json { .. } => Some("application/json"),
+        crate::body::Body::Empty | crate::body::Body::Multipart { .. } => None,
+    }
+}
+
 /// Classify a reqwest error as timeout, TLS or other network failure.
 fn map_reqwest_error(error: reqwest::Error) -> Error {
     use std::error::Error as _;
@@ -339,28 +348,26 @@ impl ReqwestBackend {
                     }
                     req_builder = req_builder.multipart(form);
                 }
-                crate::body::Body::Form { .. } => {
-                    if let Some(callback) = request.progress_callback.as_ref() {
-                        // For form data with progress tracking, we need to convert to bytes first
-                        let bytes = self.body_to_bytes(&body)?;
-                        let stream = ProgressTrackingStream::new(bytes, callback.clone(), 8192);
-                        req_builder = req_builder
-                            .header("Content-Type", "application/x-www-form-urlencoded")
-                            .body(reqwest::Body::wrap_stream(stream));
-                    } else {
-                        req_builder = req_builder
-                            .header("Content-Type", "application/x-www-form-urlencoded")
-                            .body(self.convert_body(body)?);
-                    }
-                }
                 _ => {
+                    if let Some(content_type) = body_content_type(&body) {
+                        if !request.headers.contains_key(http::header::CONTENT_TYPE) {
+                            req_builder =
+                                req_builder.header(http::header::CONTENT_TYPE, content_type);
+                        }
+                    }
+                    let bytes = self.body_to_bytes(&body)?;
                     if let Some(callback) = &request.progress_callback {
-                        // Use progress tracking for upload
-                        let bytes = self.body_to_bytes(&body)?;
-                        let stream = ProgressTrackingStream::new(bytes, callback.clone(), 8192);
-                        req_builder = req_builder.body(reqwest::Body::wrap_stream(stream));
+                        // A wrapped stream has no length, and hyper would
+                        // otherwise send it chunked.
+                        req_builder = req_builder
+                            .header(http::header::CONTENT_LENGTH, bytes.len())
+                            .body(reqwest::Body::wrap_stream(ProgressTrackingStream::new(
+                                bytes,
+                                callback.clone(),
+                                64 * 1024,
+                            )));
                     } else {
-                        req_builder = req_builder.body(self.convert_body(body)?);
+                        req_builder = req_builder.body(bytes);
                     }
                 }
             }
@@ -387,30 +394,6 @@ impl ReqwestBackend {
             }),
             redirect_headers: vec![],
         })
-    }
-
-    fn convert_body(&self, body: crate::body::Body) -> Result<reqwest::Body> {
-        match body {
-            crate::body::Body::Empty => Ok(reqwest::Body::from("")),
-            crate::body::Body::Bytes { content, .. } => Ok(reqwest::Body::from(content)),
-            crate::body::Body::Form { fields } => {
-                let form_data = fields
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-                    .collect::<Vec<_>>()
-                    .join("&");
-                Ok(reqwest::Body::from(form_data))
-            }
-            crate::body::Body::Json { value } => {
-                let json_bytes =
-                    serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?;
-                Ok(reqwest::Body::from(json_bytes))
-            }
-            crate::body::Body::Multipart { .. } => {
-                // Multipart is handled separately in the execute function
-                Ok(reqwest::Body::from(""))
-            }
-        }
     }
 
     fn body_to_bytes(&self, body: &crate::body::Body) -> Result<Bytes> {
