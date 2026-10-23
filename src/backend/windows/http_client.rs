@@ -1,954 +1,682 @@
-//! WinHTTP client utilities for Windows backend
+//! WinHTTP request execution for the Windows backend.
+//!
+//! Lifetime hazards, and how they are handled:
+//!
+//! - WinHTTP can call back, or complete a read into our buffer, until it
+//!   reports `WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING` for the request handle.
+//!   The callback context is therefore an `Arc<RequestContext>` of which
+//!   WinHTTP owns one reference, released only in that notification. The read
+//!   buffer and the upload body live in the context.
+//! - Every path that abandons a request (an error, the `execute` future being
+//!   dropped at an await, the body stream being dropped) closes the request
+//!   handle through [`RequestHandle`], which makes WinHTTP cancel the transfer.
+//! - The connection handle belongs to the context, so it is closed only after
+//!   the request handle has finished closing.
 
-use crate::backend::types::BackendResponse;
+use crate::backend::types::{BackendRequest, BackendResponse, channel_body};
 use crate::{Error, Result};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, StatusCode};
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-use windows::{
-    Win32::Foundation::{GetLastError, VARIANT_TRUE},
-    Win32::Networking::WinHttp::{
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_ASYNC_RESULT,
-        WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, WINHTTP_CALLBACK_STATUS_CLOSING_CONNECTION,
-        WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER, WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER,
-        WINHTTP_CALLBACK_STATUS_CONNECTION_CLOSED, WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,
-        WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING, WINHTTP_CALLBACK_STATUS_HANDLE_CREATED,
-        WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, WINHTTP_CALLBACK_STATUS_INTERMEDIATE_RESPONSE,
-        WINHTTP_CALLBACK_STATUS_NAME_RESOLVED, WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
-        WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE, WINHTTP_CALLBACK_STATUS_REDIRECT,
-        WINHTTP_CALLBACK_STATUS_REQUEST_ERROR, WINHTTP_CALLBACK_STATUS_REQUEST_SENT,
-        WINHTTP_CALLBACK_STATUS_RESOLVING_NAME, WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED,
-        WINHTTP_CALLBACK_STATUS_SENDING_REQUEST, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE,
-        WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE, WINHTTP_DISABLE_COOKIES, WINHTTP_DISABLE_REDIRECTS,
-        WINHTTP_FLAG_ASYNC, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
-        WINHTTP_OPTION_CONNECT_TIMEOUT, WINHTTP_OPTION_CONTEXT_VALUE,
-        WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_OPTION_RESOLVE_TIMEOUT,
-        WINHTTP_OPTION_SEND_TIMEOUT, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_RAW_HEADERS_CRLF,
-        WINHTTP_QUERY_SET_COOKIE, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
-        WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders,
-        WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
-        WinHttpSetStatusCallback, WinHttpSetTimeouts,
-    },
-    core::{HSTRING, PCWSTR},
-};
+use tokio::sync::mpsc;
+use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Networking::WinHttp::*;
+use windows::core::{HSTRING, PCWSTR};
 
-/// Request state for async WinHTTP operations
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-enum RequestState {
-    Connecting = 0,
-    Sending = 1,
-    HeadersReceived = 2,
-    ReadingData = 3,
-    Complete = 4,
-    Error = 5,
-}
+use super::error::{map_windows_error, map_winhttp_error};
 
-impl RequestState {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Connecting,
-            1 => Self::Sending,
-            2 => Self::HeadersReceived,
-            3 => Self::ReadingData,
-            4 => Self::Complete,
-            _ => Self::Error,
+const READ_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Chunks the body channel holds before no further read is issued, so at most
+/// about 1 MiB of a body is buffered in frakt.
+const BODY_CHANNEL_CHUNKS: usize = 16;
+
+/// WinHTTP's sentinel for a failed `WinHttpSetStatusCallback`.
+const INVALID_STATUS_CALLBACK: usize = usize::MAX;
+
+/// A WinHTTP handle, closed when dropped.
+struct Handle(*mut c_void);
+
+// SAFETY: WinHTTP handles may be used and closed from any thread.
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = WinHttpCloseHandle(self.0);
+            }
         }
     }
 }
 
-impl From<RequestState> for u8 {
-    fn from(state: RequestState) -> u8 {
-        state as u8
-    }
+/// The asynchronous WinHTTP session shared by every request of one backend.
+pub(crate) struct Session {
+    handle: Handle,
 }
 
-/// Async completion result for WinHTTP operations
-type AsyncResult = Result<()>;
-
-/// Context data passed to WinHTTP callback for cookie handling, progress tracking, and async signaling
-#[repr(C)]
-struct CallbackContext {
-    cookie_storage: Option<std::sync::Arc<crate::backend::CookieJar>>,
-    request_url: url::Url,
-    progress_callback: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
-    total_body_size: u64,
-    bytes_sent: Arc<std::sync::atomic::AtomicU64>,
-
-    // Async state management
-    state: Arc<std::sync::atomic::AtomicU8>, // RequestState as u8
-    completion_sender: Arc<std::sync::Mutex<Option<oneshot::Sender<AsyncResult>>>>,
-    error_storage: Arc<std::sync::Mutex<Option<Error>>>,
-
-    // Data reading management
-    response_data: Arc<std::sync::Mutex<Vec<u8>>>,
-    reading_data: Arc<std::sync::atomic::AtomicBool>,
-    request_handle: Arc<std::sync::Mutex<Option<*mut std::ffi::c_void>>>,
-    read_buffer: Arc<std::sync::Mutex<Vec<u8>>>, // Buffer for current read operation
-    current_read_size: Arc<std::sync::atomic::AtomicU32>, // Size of current read operation
-}
-
-/// WinHTTP async callback function to handle state transitions and progress tracking
-unsafe extern "system" fn winhttp_callback(
-    h_internet: *mut std::ffi::c_void,
-    dw_context: usize,
-    dw_internet_status: u32,
-    lpv_status_information: *mut std::ffi::c_void,
-    dw_status_information_length: u32,
-) {
-    if dw_context == 0 {
-        return;
-    }
-
-    // Reconstruct Arc from raw pointer, but don't drop it
-    let context = unsafe {
-        let arc_ptr = dw_context as *const CallbackContext;
-        let context_arc = Arc::from_raw(arc_ptr);
-        let context_ref = Arc::clone(&context_arc);
-        std::mem::forget(context_arc); // Don't drop the original Arc
-        context_ref
-    };
-    let current_state =
-        RequestState::from_u8(context.state.load(std::sync::atomic::Ordering::Acquire));
-
-    // Handle async completion states
-    match dw_internet_status {
-        // Informational status updates (don't trigger completion)
-        WINHTTP_CALLBACK_STATUS_RESOLVING_NAME => {}
-        WINHTTP_CALLBACK_STATUS_NAME_RESOLVED => {}
-        WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER => {}
-        WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER => {}
-        WINHTTP_CALLBACK_STATUS_SENDING_REQUEST => {
-            // Trigger progress callback for start of upload
-            if let Some(ref progress_callback) = context.progress_callback {
-                progress_callback(0, Some(context.total_body_size));
-            }
-        }
-        WINHTTP_CALLBACK_STATUS_REQUEST_SENT => {}
-        WINHTTP_CALLBACK_STATUS_RECEIVING_RESPONSE => {}
-        WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED => {
-            // Final progress update for upload completion
-            if let Some(ref progress_callback) = context.progress_callback {
-                progress_callback(context.total_body_size, Some(context.total_body_size));
-            }
-        }
-
-        // Completion status updates (trigger completion)
-        WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
-            context.state.store(
-                RequestState::Sending.into(),
-                std::sync::atomic::Ordering::Release,
-            );
-
-            // Signal completion of send phase
-            if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                if let Some(sender) = sender_lock.take() {
-                    let _ = sender.send(Ok(()));
-                }
-            }
-        }
-
-        WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
-            context.state.store(
-                RequestState::HeadersReceived.into(),
-                std::sync::atomic::Ordering::Release,
-            );
-
-            // Process cookies if available
-            if let Some(ref cookie_storage) = context.cookie_storage {
-                // Query headers for Set-Cookie
-                let mut header_buffer_size: u32 = 0;
-                let _ = unsafe {
-                    WinHttpQueryHeaders(
-                        h_internet,
-                        WINHTTP_QUERY_RAW_HEADERS_CRLF,
+impl Session {
+    /// Open a session that uses the system proxy configuration, including
+    /// WPAD and PAC scripts, or the given `proxy` list (WinHTTP syntax, for
+    /// example `http=host:3128 https=host:3128`).
+    pub(crate) fn open(user_agent: &str, proxy: Option<&str>) -> Result<Self> {
+        let agent = HSTRING::from(user_agent);
+        let handle = unsafe {
+            match proxy {
+                Some(proxy) => WinHttpOpen(
+                    &agent,
+                    WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                    &HSTRING::from(proxy),
+                    PCWSTR::null(),
+                    WINHTTP_FLAG_ASYNC,
+                ),
+                None => {
+                    let automatic = WinHttpOpen(
+                        &agent,
+                        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                         PCWSTR::null(),
-                        None,
-                        &mut header_buffer_size,
-                        std::ptr::null_mut(),
-                    )
-                };
-
-                if header_buffer_size > 0 {
-                    let mut header_buffer = vec![0u16; (header_buffer_size / 2) as usize];
-                    let result = unsafe {
-                        WinHttpQueryHeaders(
-                            h_internet,
-                            WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                        PCWSTR::null(),
+                        WINHTTP_FLAG_ASYNC,
+                    );
+                    if automatic.is_null() {
+                        // AUTOMATIC_PROXY needs Windows 8.1; DEFAULT_PROXY only
+                        // reads the static `netsh winhttp` configuration.
+                        WinHttpOpen(
+                            &agent,
+                            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                             PCWSTR::null(),
-                            Some(header_buffer.as_mut_ptr() as *mut _),
-                            &mut header_buffer_size,
-                            std::ptr::null_mut(),
+                            PCWSTR::null(),
+                            WINHTTP_FLAG_ASYNC,
                         )
-                    };
-
-                    if result.is_ok() {
-                        let header_string = String::from_utf16_lossy(&header_buffer);
-                        store_cookies_from_headers(
-                            &header_string,
-                            &context.request_url,
-                            cookie_storage,
-                        );
-                    }
-                }
-            }
-
-            // Signal headers received
-            if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                if let Some(sender) = sender_lock.take() {
-                    let _ = sender.send(Ok(()));
-                }
-            }
-        }
-
-        WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
-            context.state.store(
-                RequestState::ReadingData.into(),
-                std::sync::atomic::Ordering::Release,
-            );
-
-            // If we have data available, trigger a read
-            if dw_status_information_length > 0 {
-                // Copy request handle and release lock before calling WinHTTP API
-                let request_handle = {
-                    if let Ok(handle_lock) = context.request_handle.lock() {
-                        *handle_lock
                     } else {
-                        None
-                    }
-                };
-
-                if let Some(request_handle) = request_handle {
-                    context
-                        .reading_data
-                        .store(true, std::sync::atomic::Ordering::Release);
-
-                    // Use a fixed 8KB buffer size to match WinHTTP internal buffer
-                    let buffer_size = 8192;
-
-                    // Always try to read with full buffer size for efficiency
-                    // WinHTTP will read as much as actually available up to this size
-                    let read_size = buffer_size as u32;
-
-                    // Store the expected read size for the callback
-                    context
-                        .current_read_size
-                        .store(read_size, std::sync::atomic::Ordering::Release);
-
-                    // Allocate and store buffer in context, then get a pointer to it
-                    let buffer_ptr = {
-                        if let Ok(mut context_buffer) = context.read_buffer.lock() {
-                            *context_buffer = vec![0u8; read_size as usize];
-                            context_buffer.as_mut_ptr() as *mut _
-                        } else {
-                            std::ptr::null_mut()
-                        }
-                    };
-
-                    // Call WinHTTP API with the persistent buffer pointer
-                    let result = unsafe {
-                        windows::Win32::Networking::WinHttp::WinHttpReadData(
-                            request_handle,
-                            buffer_ptr,
-                            read_size,
-                            std::ptr::null_mut(), // NULL for async mode - get result in callback
-                        )
-                    };
-
-                    if result.is_err() {
-                        context
-                            .reading_data
-                            .store(false, std::sync::atomic::Ordering::Release);
-                        // Signal error
-                        if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                            if let Some(sender) = sender_lock.take() {
-                                let _ = sender
-                                    .send(Err(Error::Internal("Failed to read data".to_string())));
-                            }
-                        }
+                        automatic
                     }
                 }
-            } else {
-                // No more data available - signal completion
-                if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                    if let Some(sender) = sender_lock.take() {
-                        let _ = sender.send(Ok(()));
-                    }
-                }
-            }
-        }
-
-        WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
-            context
-                .reading_data
-                .store(false, std::sync::atomic::Ordering::Release);
-
-            // Access the buffer we provided to WinHttpReadData and copy the read data
-            if dw_status_information_length > 0 {
-                if let Ok(context_buffer) = context.read_buffer.lock() {
-                    if context_buffer.len() >= dw_status_information_length as usize {
-                        let data_slice = &context_buffer[..dw_status_information_length as usize];
-                        if let Ok(mut response_data) = context.response_data.lock() {
-                            response_data.extend_from_slice(data_slice);
-                        }
-                    }
-                }
-            } else {
-                // When we read 0 bytes, it means no data is available, signal completion
-                if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                    if let Some(sender) = sender_lock.take() {
-                        let _ = sender.send(Ok(()));
-                    }
-                }
-                return; // Exit early, don't query for more data
-            }
-
-            // Always query for more data after a read, regardless of bytes read
-            // WinHTTP will tell us via DATA_AVAILABLE if there's more data or not
-
-            // Copy request handle and release lock before calling WinHTTP API
-            let request_handle = {
-                if let Ok(handle_lock) = context.request_handle.lock() {
-                    *handle_lock
-                } else {
-                    None
-                }
-            };
-
-            if let Some(request_handle) = request_handle {
-                // Call WinHTTP API outside of any locks to prevent deadlock
-                let result = unsafe {
-                    windows::Win32::Networking::WinHttp::WinHttpQueryDataAvailable(
-                        request_handle,
-                        std::ptr::null_mut(), // NULL for async mode - get result in callback
-                    )
-                };
-
-                match result {
-                    Ok(_) => {} // Success - callback will handle DATA_AVAILABLE
-                    Err(e) => {
-                        // Signal completion on query error
-                        if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                            if let Some(sender) = sender_lock.take() {
-                                let _ = sender.send(Ok(()));
-                            }
-                        }
-                    }
-                }
-            } else {
-                // No handle available - signal completion
-                if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                    if let Some(sender) = sender_lock.take() {
-                        let _ = sender.send(Ok(()));
-                    }
-                }
-            }
-        }
-
-        WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE => {
-            // Track upload progress
-            let bytes_sent = context.bytes_sent.fetch_add(
-                dw_status_information_length as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            ) + dw_status_information_length as u64;
-
-            if let Some(ref progress_callback) = context.progress_callback {
-                progress_callback(bytes_sent, Some(context.total_body_size));
-            }
-        }
-
-        WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
-            context.state.store(
-                RequestState::Error.into(),
-                std::sync::atomic::Ordering::Release,
-            );
-
-            // Extract error information and map to appropriate error type
-            let error = if !lpv_status_information.is_null()
-                && dw_status_information_length
-                    >= std::mem::size_of::<WINHTTP_ASYNC_RESULT>() as u32
-            {
-                let async_result =
-                    unsafe { &*(lpv_status_information as *const WINHTTP_ASYNC_RESULT) };
-
-                // Map specific error codes to appropriate error types
-                match async_result.dwError {
-                    12002 => Error::Timeout, // ERROR_WINHTTP_TIMEOUT
-                    _ => Error::Internal(format!(
-                        "WinHTTP async error: dwResult={}, dwError={}",
-                        async_result.dwResult, async_result.dwError
-                    )),
-                }
-            } else {
-                Error::Internal("Unknown WinHTTP async error".to_string())
-            };
-
-            // Store error for inspection
-            if let Ok(mut error_lock) = context.error_storage.lock() {
-                *error_lock = Some(match &error {
-                    Error::Timeout => Error::Timeout,
-                    Error::Internal(msg) => Error::Internal(msg.clone()),
-                    _ => Error::Internal("Request failed".to_string()),
-                });
-            }
-
-            // Signal error completion with the specific error type
-            if let Ok(mut sender_lock) = context.completion_sender.lock() {
-                if let Some(sender) = sender_lock.take() {
-                    let _ = sender.send(Err(error));
-                }
-            }
-        }
-
-        // Connection status updates - no action needed
-        WINHTTP_CALLBACK_STATUS_CLOSING_CONNECTION
-        | WINHTTP_CALLBACK_STATUS_CONNECTION_CLOSED
-        | WINHTTP_CALLBACK_STATUS_HANDLE_CREATED
-        | WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING
-        | WINHTTP_CALLBACK_STATUS_REDIRECT
-        | WINHTTP_CALLBACK_STATUS_INTERMEDIATE_RESPONSE
-        | _ => {}
-    }
-}
-
-/// Execute an HTTP request using WinHTTP in async mode
-pub async fn execute_winhttp_request(
-    request: crate::backend::types::BackendRequest,
-    user_agent: &str,
-    default_headers: &Option<http::HeaderMap>,
-    timeout: &Option<Duration>,
-    cookie_storage: &Option<std::sync::Arc<crate::backend::CookieJar>>,
-) -> Result<BackendResponse> {
-    let url = request.url;
-    let method = request.method;
-    let headers = request.headers;
-    let body = request.body;
-    let progress_callback = request.progress_callback;
-
-    // Use request timeout if specified, otherwise fall back to backend timeout
-    let effective_timeout = request.read_timeout.as_ref().or(timeout.as_ref());
-
-    // Parse URL components
-    let scheme = url.scheme();
-    let host = url.host_str().ok_or(Error::InvalidUrl)?;
-    let port = url
-        .port()
-        .unwrap_or(if scheme == "https" { 443 } else { 80 });
-    let path = url.path();
-    let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    let full_path = format!("{}{}", path, query);
-
-    // Prepare body data and determine content type
-    let (body_bytes, body_content_type) = if let Some(body_data) = body {
-        match body_data {
-            crate::body::Body::Empty => (Vec::new(), None),
-            crate::body::Body::Bytes { content, .. } => (content.to_vec(), None),
-            crate::body::Body::Form { fields } => {
-                let encoded = fields
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-                    .collect::<Vec<_>>()
-                    .join("&");
-                (
-                    encoded.into_bytes(),
-                    Some("application/x-www-form-urlencoded"),
-                )
-            }
-            crate::body::Body::Json { value } => {
-                let json_bytes = serde_json::to_string(&value)
-                    .map_err(|e| Error::Internal(format!("Failed to serialize JSON: {}", e)))?
-                    .into_bytes();
-                (json_bytes, Some("application/json"))
-            }
-            crate::body::Body::Multipart { .. } => {
-                return Err(Error::Internal(
-                    "Multipart not yet supported with WinHTTP".to_string(),
-                ));
-            }
-        }
-    } else {
-        (Vec::new(), None)
-    };
-
-    // Execute the async WinHTTP request
-    execute_async_winhttp(
-        method,
-        &url,
-        scheme,
-        host,
-        port,
-        &full_path,
-        user_agent,
-        &headers,
-        default_headers,
-        &body_bytes,
-        body_content_type,
-        effective_timeout,
-        cookie_storage,
-        &progress_callback,
-    )
-    .await
-}
-
-/// Execute async WinHTTP request with proper state machine
-async fn execute_async_winhttp(
-    method: http::Method,
-    url: &url::Url,
-    scheme: &str,
-    host: &str,
-    port: u16,
-    full_path: &str,
-    user_agent: &str,
-    headers: &http::HeaderMap,
-    default_headers: &Option<http::HeaderMap>,
-    body_bytes: &[u8],
-    body_content_type: Option<&str>,
-    timeout: Option<&Duration>,
-    cookie_storage: &Option<std::sync::Arc<crate::backend::CookieJar>>,
-    progress_callback: &Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
-) -> Result<BackendResponse> {
-    // Build headers string
-    let mut header_string = String::new();
-
-    // Add default headers
-    if let Some(default_headers) = default_headers {
-        for (name, value) in default_headers {
-            header_string.push_str(&format!(
-                "{}: {}\r\n",
-                name.as_str(),
-                value.to_str().unwrap_or("")
-            ));
-        }
-    }
-
-    // Add request headers
-    for (name, value) in headers {
-        header_string.push_str(&format!(
-            "{}: {}\r\n",
-            name.as_str(),
-            value.to_str().unwrap_or("")
-        ));
-    }
-
-    // Add Content-Type for body if provided by body type
-    if let Some(content_type) = body_content_type {
-        if !header_string.contains("Content-Type:") {
-            header_string.push_str(&format!("Content-Type: {}\r\n", content_type));
-        }
-    }
-
-    // Add cookies if available
-    if let Some(cookie_storage) = cookie_storage {
-        if let Ok(cookie_headers) = cookie_storage.get_cookies_for_url(url) {
-            for (name, value) in &cookie_headers {
-                header_string.push_str(&format!(
-                    "{}: {}\r\n",
-                    name.as_str(),
-                    value.to_str().unwrap_or("")
-                ));
-            }
-        }
-    }
-
-    // Execute the async WinHTTP request
-    unsafe {
-        // Open WinHTTP session with async flag
-        let user_agent_wide = HSTRING::from(user_agent);
-        let session = WinHttpOpen(
-            &user_agent_wide,
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            WINHTTP_FLAG_ASYNC, // Enable async mode
-        );
-
-        if session.is_null() {
-            return Err(Error::Internal(format!(
-                "Failed to open WinHTTP session: {}",
-                GetLastError().0
-            )));
-        }
-
-        // Set timeout if configured
-        if let Some(timeout_duration) = timeout {
-            let timeout_ms = timeout_duration.as_millis() as i32;
-            WinHttpSetTimeouts(
-                session, timeout_ms, // Resolve timeout
-                timeout_ms, // Connect timeout
-                timeout_ms, // Send timeout
-                timeout_ms, // Receive timeout
-            )
-            .map_err(|e| {
-                let _ = WinHttpCloseHandle(session);
-                Error::Internal(format!("Failed to set timeouts: {}", e))
-            })?;
-        }
-
-        // Connect to server
-        let host_wide = HSTRING::from(host);
-        let connection = WinHttpConnect(session, &host_wide, port, 0);
-
-        if connection.is_null() {
-            let _ = WinHttpCloseHandle(session);
-            return Err(Error::Internal(format!(
-                "Failed to connect to server: {}",
-                GetLastError().0
-            )));
-        }
-
-        // Open request
-        let method_wide = HSTRING::from(method.as_str());
-        let path_wide = HSTRING::from(full_path);
-        let mut flags = WINHTTP_OPEN_REQUEST_FLAGS(0);
-        if scheme == "https" {
-            flags = WINHTTP_FLAG_SECURE;
-        }
-
-        let request_handle = WinHttpOpenRequest(
-            connection,
-            &method_wide,
-            &path_wide,
-            PCWSTR::null(),   // HTTP version (default)
-            PCWSTR::null(),   // Referrer
-            std::ptr::null(), // Accept types
-            flags,
-        );
-
-        if request_handle.is_null() {
-            let _ = WinHttpCloseHandle(connection);
-            let _ = WinHttpCloseHandle(session);
-            return Err(Error::Internal(format!(
-                "Failed to open request: {}",
-                GetLastError().0
-            )));
-        }
-
-        // Set up async callback context
-        let (send_completion_tx, send_completion_rx) = oneshot::channel();
-        let (headers_completion_tx, headers_completion_rx) = oneshot::channel();
-        let (data_completion_tx, data_completion_rx) = oneshot::channel();
-
-        let callback_context = Arc::new(CallbackContext {
-            cookie_storage: cookie_storage.clone(),
-            request_url: url.clone(),
-            progress_callback: progress_callback.clone(),
-            total_body_size: body_bytes.len() as u64,
-            bytes_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            state: Arc::new(std::sync::atomic::AtomicU8::new(
-                RequestState::Connecting.into(),
-            )),
-            completion_sender: Arc::new(std::sync::Mutex::new(Some(send_completion_tx))),
-            error_storage: Arc::new(std::sync::Mutex::new(None)),
-            response_data: Arc::new(std::sync::Mutex::new(Vec::new())),
-            reading_data: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            request_handle: Arc::new(std::sync::Mutex::new(Some(request_handle))),
-            read_buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
-            current_read_size: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        });
-        let callback_ctx_ptr = Arc::into_raw(callback_context.clone());
-
-        // Set callback
-        let callback_flags = WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS;
-        let _ = WinHttpSetStatusCallback(request_handle, Some(winhttp_callback), callback_flags, 0);
-
-        // Set callback context
-        WinHttpSetOption(
-            Some(request_handle),
-            WINHTTP_OPTION_CONTEXT_VALUE,
-            Some(&(callback_ctx_ptr as usize).to_ne_bytes()),
-        )
-        .map_err(|e| {
-            let _ = WinHttpCloseHandle(request_handle);
-            let _ = WinHttpCloseHandle(connection);
-            let _ = WinHttpCloseHandle(session);
-            drop(Arc::from_raw(callback_ctx_ptr));
-            Error::Internal(format!("Failed to set callback context: {}", e))
-        })?;
-
-        // Set other options
-        WinHttpSetOption(
-            Some(request_handle),
-            WINHTTP_OPTION_DISABLE_FEATURE,
-            Some(&(WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS).to_ne_bytes()),
-        )
-        .map_err(|e| {
-            let _ = WinHttpCloseHandle(request_handle);
-            let _ = WinHttpCloseHandle(connection);
-            let _ = WinHttpCloseHandle(session);
-            drop(Arc::from_raw(callback_ctx_ptr));
-            Error::Internal(format!("Failed to disable cookies: {}", e))
-        })?;
-
-        // Prepare headers for WinHTTP
-        let headers_wide = if !header_string.is_empty() {
-            Some(
-                header_string
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect::<Vec<u16>>(),
-            )
-        } else {
-            None
-        };
-
-        let (headers_ptr, body_ptr, body_len, total_len) = if let Some(ref headers) = headers_wide {
-            let headers_slice = &headers[..headers.len() - 1]; // Exclude null terminator
-
-            if !body_bytes.is_empty() {
-                (
-                    Some(headers_slice),
-                    Some(body_bytes.as_ptr() as *const _),
-                    body_bytes.len() as u32,
-                    body_bytes.len() as u32,
-                )
-            } else {
-                (Some(headers_slice), None, 0, 0)
-            }
-        } else {
-            if !body_bytes.is_empty() {
-                (
-                    None,
-                    Some(body_bytes.as_ptr() as *const _),
-                    body_bytes.len() as u32,
-                    body_bytes.len() as u32,
-                )
-            } else {
-                (None, None, 0, 0)
             }
         };
-
-        // Start async send request
-        WinHttpSendRequest(
-            request_handle,
-            headers_ptr,
-            body_ptr,
-            body_len,
-            total_len,
-            0,
-        )
-        .map_err(|e| {
-            let _ = WinHttpCloseHandle(request_handle);
-            let _ = WinHttpCloseHandle(connection);
-            let _ = WinHttpCloseHandle(session);
-            drop(Arc::from_raw(callback_ctx_ptr));
-            Error::Internal(format!("Failed to start send request: {}", e))
-        })?;
-
-        // Wait for send completion
-        match send_completion_rx.await {
-            Ok(Ok(())) => {} // Success
-            Ok(Err(e)) => {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                return Err(e);
-            }
-            Err(_) => {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                return Err(Error::Internal(
-                    "Send completion channel closed".to_string(),
-                ));
-            }
+        if handle.is_null() {
+            return Err(last_error("WinHttpOpen"));
         }
-
-        // Reset completion sender for headers phase
-        if let Ok(mut sender_lock) = callback_context.completion_sender.lock() {
-            *sender_lock = Some(headers_completion_tx);
-        }
-
-        // Start receiving response
-        WinHttpReceiveResponse(request_handle, std::ptr::null_mut()).map_err(|e| {
-            let _ = WinHttpCloseHandle(request_handle);
-            let _ = WinHttpCloseHandle(connection);
-            let _ = WinHttpCloseHandle(session);
-            drop(Arc::from_raw(callback_ctx_ptr));
-            Error::Internal(format!("Failed to start receive response: {}", e))
-        })?;
-
-        // Wait for headers completion
-        match headers_completion_rx.await {
-            Ok(Ok(())) => {} // Success
-            Ok(Err(e)) => {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                return Err(e);
-            }
-            Err(_) => {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                return Err(Error::Internal(
-                    "Headers completion channel closed".to_string(),
-                ));
-            }
-        }
-
-        // Get status code and headers synchronously (they're available now)
-        let mut status_code: u32 = 0;
-        let mut status_code_size = std::mem::size_of::<u32>() as u32;
-        WinHttpQueryHeaders(
-            request_handle,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status_code as *mut _ as *mut _),
-            &mut status_code_size,
-            std::ptr::null_mut(),
-        )
-        .unwrap_or(());
-
-        let status = http::StatusCode::from_u16(status_code as u16)
-            .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-
-        // Get headers
-        let mut response_headers = http::HeaderMap::new();
-        let mut header_buffer_size: u32 = 0;
-
-        // First call to get buffer size
-        let _ = WinHttpQueryHeaders(
-            request_handle,
-            WINHTTP_QUERY_RAW_HEADERS_CRLF,
-            PCWSTR::null(),
-            None,
-            &mut header_buffer_size,
-            std::ptr::null_mut(),
-        );
-
-        if header_buffer_size > 0 {
-            let mut header_buffer = vec![0u16; (header_buffer_size / 2) as usize];
-            let result = WinHttpQueryHeaders(
-                request_handle,
-                WINHTTP_QUERY_RAW_HEADERS_CRLF,
-                PCWSTR::null(),
-                Some(header_buffer.as_mut_ptr() as *mut _),
-                &mut header_buffer_size,
-                std::ptr::null_mut(),
-            );
-
-            if result.is_ok() {
-                let header_string = String::from_utf16_lossy(&header_buffer);
-                parse_headers_into_map(&header_string, &mut response_headers);
-
-                // Store cookies if we have cookie storage
-                if let Some(cookie_storage) = cookie_storage {
-                    store_cookies_from_headers(&header_string, url, cookie_storage);
-                }
-            }
-        }
-
-        // Reset completion sender for data reading phase
-        if let Ok(mut sender_lock) = callback_context.completion_sender.lock() {
-            *sender_lock = Some(data_completion_tx);
-        }
-
-        // Start async data reading by querying data availability
-        WinHttpQueryDataAvailable(request_handle, std::ptr::null_mut()) // NULL for async mode
-            .map_err(|e| {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                Error::Internal(format!("Failed to start data query: {}", e))
-            })?;
-
-        // Wait for data reading completion
-        match data_completion_rx.await {
-            Ok(Ok(())) => {} // Success
-            Ok(Err(e)) => {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                return Err(e);
-            }
-            Err(_) => {
-                let _ = WinHttpCloseHandle(request_handle);
-                let _ = WinHttpCloseHandle(connection);
-                let _ = WinHttpCloseHandle(session);
-                drop(Arc::from_raw(callback_ctx_ptr));
-                return Err(Error::Internal(
-                    "Data reading completion channel closed".to_string(),
-                ));
-            }
-        }
-
-        // Get the accumulated response data
-        let response_data = if let Ok(data_lock) = callback_context.response_data.lock() {
-            let data = data_lock.clone();
-            data
-        } else {
-            Vec::new()
-        };
-
-        // Clean up
-        drop(Arc::from_raw(callback_ctx_ptr));
-        let _ = WinHttpCloseHandle(request_handle);
-        let _ = WinHttpCloseHandle(connection);
-        let _ = WinHttpCloseHandle(session);
-
-        // Create channel and send response data
-        let (tx, rx) = mpsc::channel(1);
-        if !response_data.is_empty() {
-            let _ = tx.try_send(Ok(bytes::Bytes::from(response_data)));
-        }
-
-        Ok(BackendResponse {
-            status,
-            headers: response_headers,
-            url: url.clone(),
-            body: crate::backend::types::channel_body(rx),
-            redirect_headers: vec![],
+        Ok(Session {
+            handle: Handle(handle),
         })
     }
 }
 
-/// Parse raw HTTP headers into HeaderMap
-fn parse_headers_into_map(header_string: &str, headers: &mut http::HeaderMap) {
-    for line in header_string.lines() {
-        if let Some(colon_pos) = line.find(':') {
-            let name = line[..colon_pos].trim();
-            let value = line[colon_pos + 1..].trim();
+/// Backend settings a request needs.
+pub(crate) struct RequestConfig<'a> {
+    pub session: &'a Arc<Session>,
+    pub default_headers: Option<&'a HeaderMap>,
+    pub cookie_storage: Option<&'a Arc<crate::backend::CookieJar>>,
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub ignore_certificate_errors: bool,
+}
 
-            if let (Ok(header_name), Ok(header_value)) = (
-                http::HeaderName::from_bytes(name.as_bytes()),
-                http::HeaderValue::from_str(value),
-            ) {
-                headers.insert(header_name, header_value);
+enum Event {
+    SendComplete,
+    HeadersAvailable,
+    Read(Bytes),
+    Failed(u32),
+}
+
+struct RequestContext {
+    events: mpsc::UnboundedSender<Event>,
+    /// `READ_BUFFER_SIZE` bytes that WinHTTP writes into asynchronously.
+    read_buffer: *mut u8,
+    /// Passed to `WinHttpSendRequest`, which reads it until the response
+    /// arrives.
+    upload: Vec<u8>,
+    /// Held so the connection handle outlives the request handle.
+    _connect: Handle,
+    _session: Arc<Session>,
+}
+
+// SAFETY: the read buffer is only written by WinHTTP while a read is pending
+// and only read by the callback that completes it; one read is outstanding
+// at a time.
+unsafe impl Send for RequestContext {}
+unsafe impl Sync for RequestContext {}
+
+impl Drop for RequestContext {
+    fn drop(&mut self) {
+        let buffer = std::ptr::slice_from_raw_parts_mut(self.read_buffer, READ_BUFFER_SIZE);
+        drop(unsafe { Box::from_raw(buffer) });
+    }
+}
+
+/// The request handle. Dropping it closes the handle, cancelling whatever
+/// WinHTTP is doing for the request.
+struct RequestHandle(Handle);
+
+impl RequestHandle {
+    fn raw(&self) -> *mut c_void {
+        self.0.0
+    }
+}
+
+unsafe extern "system" fn status_callback(
+    _handle: *mut c_void,
+    context: usize,
+    status: u32,
+    info: *mut c_void,
+    info_len: u32,
+) {
+    if context == 0 {
+        return;
+    }
+    let context = context as *const RequestContext;
+
+    if status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING {
+        // The last notification for the handle: release WinHTTP's reference.
+        drop(unsafe { Arc::from_raw(context) });
+        return;
+    }
+
+    let context = unsafe { &*context };
+    let event = match status {
+        WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => Event::SendComplete,
+        WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => Event::HeadersAvailable,
+        WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
+            let len = (info_len as usize).min(READ_BUFFER_SIZE);
+            if len == 0 || info.is_null() {
+                Event::Read(Bytes::new())
+            } else {
+                let data = unsafe { std::slice::from_raw_parts(info as *const u8, len) };
+                Event::Read(Bytes::copy_from_slice(data))
             }
+        }
+        WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
+            let code = if info.is_null() {
+                ERROR_WINHTTP_INTERNAL_ERROR
+            } else {
+                unsafe { (*(info as *const WINHTTP_ASYNC_RESULT)).dwError }
+            };
+            Event::Failed(code)
+        }
+        _ => return,
+    };
+    let _ = context.events.send(event);
+}
+
+/// Execute an HTTP request with WinHTTP, returning once the response headers
+/// have arrived. The body is read as the returned stream is consumed.
+pub(crate) async fn execute(
+    config: RequestConfig<'_>,
+    request: BackendRequest,
+) -> Result<BackendResponse> {
+    let url = request.url;
+    let https = match url.scheme() {
+        "https" => true,
+        "http" => false,
+        _ => return Err(Error::InvalidUrl),
+    };
+    let host = match url.host() {
+        Some(url::Host::Ipv6(address)) => address.to_string(),
+        Some(host) => host.to_string(),
+        None => return Err(Error::InvalidUrl),
+    };
+    let port = url.port_or_known_default().ok_or(Error::InvalidUrl)?;
+    let mut object = url.path().to_string();
+    if let Some(query) = url.query() {
+        object.push('?');
+        object.push_str(query);
+    }
+
+    let (upload, content_type) = encode_body(request.body)?;
+    let cookies = config
+        .cookie_storage
+        .and_then(|storage| storage.get_cookies_for_url(&url).ok());
+    let headers = request_headers(
+        config.default_headers,
+        &request.headers,
+        cookies,
+        content_type,
+    );
+    let read_timeout = request.read_timeout.or(config.read_timeout);
+    let progress = request.progress_callback;
+    let head_request = request.method == http::Method::HEAD;
+
+    let connect =
+        Handle(unsafe { WinHttpConnect(config.session.handle.0, &HSTRING::from(host), port, 0) });
+    if connect.0.is_null() {
+        return Err(last_error("WinHttpConnect"));
+    }
+
+    let flags = if https {
+        WINHTTP_FLAG_SECURE
+    } else {
+        WINHTTP_OPEN_REQUEST_FLAGS(0)
+    };
+    let raw = unsafe {
+        WinHttpOpenRequest(
+            connect.0,
+            &HSTRING::from(request.method.as_str()),
+            &HSTRING::from(object),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            std::ptr::null(),
+            flags,
+        )
+    };
+    if raw.is_null() {
+        return Err(last_error("WinHttpOpenRequest"));
+    }
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let read_buffer = Box::into_raw(vec![0u8; READ_BUFFER_SIZE].into_boxed_slice()) as *mut u8;
+    let context = Arc::new(RequestContext {
+        events: events_tx,
+        read_buffer,
+        upload,
+        _connect: connect,
+        _session: config.session.clone(),
+    });
+    // Declared after `context` so it is dropped, and the handle closed, first.
+    let handle = RequestHandle(Handle(raw));
+
+    let notifications = WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE
+        | WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE
+        | WINHTTP_CALLBACK_FLAG_READ_COMPLETE
+        | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR
+        | WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING;
+    let previous =
+        unsafe { WinHttpSetStatusCallback(handle.raw(), Some(status_callback), notifications, 0) };
+    if previous.map(|callback| callback as usize) == Some(INVALID_STATUS_CALLBACK) {
+        return Err(last_error("WinHttpSetStatusCallback"));
+    }
+
+    let context_value = Arc::into_raw(context.clone()) as usize;
+    if let Err(error) = unsafe {
+        WinHttpSetOption(
+            Some(handle.raw()),
+            WINHTTP_OPTION_CONTEXT_VALUE,
+            Some(&context_value.to_ne_bytes()),
+        )
+    } {
+        // WinHTTP did not take the reference, so HANDLE_CLOSING won't free it.
+        drop(unsafe { Arc::from_raw(context_value as *const RequestContext) });
+        return Err(map_windows_error(error));
+    }
+
+    // Cookies are handled by frakt's own jar.
+    set_option_u32(
+        handle.raw(),
+        WINHTTP_OPTION_DISABLE_FEATURE,
+        WINHTTP_DISABLE_COOKIES,
+    )?;
+    if config.ignore_certificate_errors {
+        set_option_u32(
+            handle.raw(),
+            WINHTTP_OPTION_SECURITY_FLAGS,
+            SECURITY_FLAG_IGNORE_UNKNOWN_CA
+                | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
+                | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE,
+        )?;
+    }
+
+    // The receive timeouts bound each wait for the network (the response
+    // headers, then every WinHttpReadData), which is the read timeout's
+    // meaning. Reads are only issued when the consumer has room, so a slow
+    // consumer does not run the clock.
+    let connect_ms = timeout_ms(config.connect_timeout);
+    let read_ms = timeout_ms(read_timeout);
+    unsafe { WinHttpSetTimeouts(handle.raw(), connect_ms, connect_ms, read_ms, read_ms) }
+        .map_err(map_windows_error)?;
+    set_option_u32(
+        handle.raw(),
+        WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT,
+        read_ms as u32,
+    )?;
+
+    let upload_len = context.upload.len() as u64;
+    if upload_len > 0 {
+        if let Some(progress) = &progress {
+            progress(0, Some(upload_len));
+        }
+    }
+    let upload = (!context.upload.is_empty()).then(|| context.upload.as_ptr() as *const c_void);
+    unsafe {
+        WinHttpSendRequest(
+            handle.raw(),
+            (!headers.is_empty()).then_some(headers.as_slice()),
+            upload,
+            upload_len as u32,
+            upload_len as u32,
+            context_value,
+        )
+    }
+    .map_err(map_windows_error)?;
+
+    expect_event(&mut events, |event| matches!(event, Event::SendComplete)).await?;
+    if upload_len > 0 {
+        if let Some(progress) = &progress {
+            progress(upload_len, Some(upload_len));
+        }
+    }
+
+    unsafe { WinHttpReceiveResponse(handle.raw(), std::ptr::null_mut()) }
+        .map_err(map_windows_error)?;
+    expect_event(&mut events, |event| {
+        matches!(event, Event::HeadersAvailable)
+    })
+    .await?;
+
+    let status = query_status(handle.raw())?;
+    let response_headers = query_response_headers(handle.raw())?;
+    let final_url = query_url(handle.raw()).unwrap_or(url);
+
+    if let Some(storage) = config.cookie_storage {
+        let _ = storage.process_response_headers(&final_url, &response_headers);
+    }
+
+    let expected_len = if head_request
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+        || response_headers.contains_key(http::header::CONTENT_ENCODING)
+    {
+        None
+    } else {
+        response_headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+
+    let (tx, rx) = mpsc::channel(BODY_CHANNEL_CHUNKS);
+    tokio::spawn(read_body(handle, context, events, tx, expected_len));
+
+    Ok(BackendResponse {
+        status,
+        headers: response_headers,
+        url: final_url,
+        body: channel_body(rx),
+        redirect_headers: vec![],
+    })
+}
+
+/// Read the body into `tx`, one `WinHttpReadData` per reserved channel slot.
+async fn read_body(
+    handle: RequestHandle,
+    context: Arc<RequestContext>,
+    mut events: mpsc::UnboundedReceiver<Event>,
+    tx: mpsc::Sender<Result<Bytes>>,
+    expected_len: Option<u64>,
+) {
+    let mut received = 0u64;
+    loop {
+        let Ok(permit) = tx.reserve().await else {
+            return;
+        };
+
+        if let Err(error) = unsafe {
+            WinHttpReadData(
+                handle.raw(),
+                context.read_buffer as *mut c_void,
+                READ_BUFFER_SIZE as u32,
+                std::ptr::null_mut(),
+            )
+        } {
+            permit.send(Err(map_windows_error(error)));
+            return;
+        }
+
+        let event = tokio::select! {
+            event = events.recv() => event,
+            // The consumer went away mid-read; returning closes the handle,
+            // which cancels the read.
+            _ = tx.closed() => return,
+        };
+
+        match event {
+            Some(Event::Read(data)) if data.is_empty() => {
+                if let Some(expected) = expected_len {
+                    if received < expected {
+                        permit.send(Err(Error::Network {
+                            code: i64::from(ERROR_WINHTTP_CONNECTION_ERROR),
+                            message: format!(
+                                "connection closed after {} of {} body bytes",
+                                received, expected
+                            ),
+                        }));
+                    }
+                }
+                return;
+            }
+            Some(Event::Read(data)) => {
+                received += data.len() as u64;
+                permit.send(Ok(data));
+            }
+            Some(Event::Failed(code)) => {
+                permit.send(Err(map_winhttp_error(code)));
+                return;
+            }
+            Some(_) => {
+                permit.send(Err(Error::Internal(
+                    "Unexpected WinHTTP notification while reading".to_string(),
+                )));
+                return;
+            }
+            None => return,
         }
     }
 }
 
-/// Store cookies from response headers
-fn store_cookies_from_headers(
-    header_string: &str,
-    url: &url::Url,
-    cookie_storage: &std::sync::Arc<crate::backend::CookieJar>,
-) {
-    // Convert the header string into an http::HeaderMap to use with cookie_store
-    let mut headers = http::HeaderMap::new();
+async fn expect_event(
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    wanted: impl Fn(&Event) -> bool,
+) -> Result<()> {
+    match events.recv().await {
+        Some(Event::Failed(code)) => Err(map_winhttp_error(code)),
+        Some(event) if wanted(&event) => Ok(()),
+        Some(_) => Err(Error::Internal(
+            "Unexpected WinHTTP notification".to_string(),
+        )),
+        None => Err(Error::Internal("WinHTTP notifications stopped".to_string())),
+    }
+}
 
-    for line in header_string.lines() {
-        if let Some(colon_pos) = line.find(':') {
-            let name = line[..colon_pos].trim();
-            let value = line[colon_pos + 1..].trim();
+fn timeout_ms(timeout: Option<Duration>) -> i32 {
+    match timeout {
+        // WinHTTP treats -1 as "wait indefinitely".
+        None => -1,
+        Some(timeout) => timeout.as_millis().clamp(1, i32::MAX as u128) as i32,
+    }
+}
 
-            if name.eq_ignore_ascii_case("set-cookie") {
-                // Add each Set-Cookie header to the HeaderMap
-                if let Ok(header_value) = http::HeaderValue::from_str(value) {
-                    let header_name = http::HeaderName::from_static("set-cookie");
-                    headers.append(header_name, header_value);
-                }
+fn set_option_u32(handle: *mut c_void, option: u32, value: u32) -> Result<()> {
+    unsafe { WinHttpSetOption(Some(handle), option, Some(&value.to_ne_bytes())) }
+        .map_err(map_windows_error)
+}
+
+fn last_error(operation: &str) -> Error {
+    let code = unsafe { GetLastError() }.0;
+    if (12000..13000).contains(&code) {
+        map_winhttp_error(code)
+    } else {
+        Error::Internal(format!("{} failed with Win32 error {}", operation, code))
+    }
+}
+
+fn encode_body(body: Option<crate::body::Body>) -> Result<(Vec<u8>, Option<String>)> {
+    Ok(match body {
+        None | Some(crate::body::Body::Empty) => (Vec::new(), None),
+        Some(crate::body::Body::Bytes {
+            content,
+            content_type,
+        }) => (content.to_vec(), Some(content_type)),
+        Some(crate::body::Body::Form { fields }) => {
+            let encoded = fields
+                .iter()
+                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            (
+                encoded.into_bytes(),
+                Some("application/x-www-form-urlencoded".to_string()),
+            )
+        }
+        Some(crate::body::Body::Json { value }) => (
+            serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?,
+            Some("application/json".to_string()),
+        ),
+        Some(crate::body::Body::Multipart { .. }) => {
+            return Err(Error::Internal(
+                "Multipart not yet supported with WinHTTP".to_string(),
+            ));
+        }
+    })
+}
+
+/// The request headers as the CRLF-separated UTF-16 block WinHTTP takes.
+fn request_headers(
+    default_headers: Option<&HeaderMap>,
+    headers: &HeaderMap,
+    cookies: Option<HeaderMap>,
+    content_type: Option<String>,
+) -> Vec<u16> {
+    let mut merged = default_headers.cloned().unwrap_or_default();
+    for name in headers.keys() {
+        merged.remove(name);
+    }
+    for (name, value) in headers {
+        merged.append(name, value.clone());
+    }
+    if let Some(content_type) = content_type {
+        if !merged.contains_key(http::header::CONTENT_TYPE) {
+            if let Ok(value) = HeaderValue::from_str(&content_type) {
+                merged.insert(http::header::CONTENT_TYPE, value);
+            }
+        }
+    }
+    if let Some(cookies) = cookies {
+        if !merged.contains_key(http::header::COOKIE) {
+            for (name, value) in &cookies {
+                merged.append(name, value.clone());
             }
         }
     }
 
-    // Process all Set-Cookie headers using the new cookie_store integration
-    let _ = cookie_storage.process_response_headers(url, &headers);
+    let mut block = Vec::new();
+    for (name, value) in &merged {
+        block.extend(name.as_str().encode_utf16());
+        block.extend(": ".encode_utf16());
+        // WinHTTP narrows header text to one byte per code unit, so widening
+        // each byte to the code unit of the same value sends non-ASCII values
+        // (UTF-8 or otherwise) unchanged.
+        block.extend(value.as_bytes().iter().map(|&byte| u16::from(byte)));
+        block.extend("\r\n".encode_utf16());
+    }
+    block
+}
+
+fn query_status(handle: *mut c_void) -> Result<StatusCode> {
+    let mut status: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            handle,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some(&mut status as *mut u32 as *mut c_void),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(map_windows_error)?;
+    u16::try_from(status)
+        .ok()
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .ok_or_else(|| Error::Internal(format!("Invalid HTTP status {}", status)))
+}
+
+fn query_response_headers(handle: *mut c_void) -> Result<HeaderMap> {
+    let mut size: u32 = 0;
+    // Fails with ERROR_INSUFFICIENT_BUFFER and reports the size in bytes.
+    let _ = unsafe {
+        WinHttpQueryHeaders(
+            handle,
+            WINHTTP_QUERY_RAW_HEADERS_CRLF,
+            PCWSTR::null(),
+            None,
+            &mut size,
+            std::ptr::null_mut(),
+        )
+    };
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    unsafe {
+        WinHttpQueryHeaders(
+            handle,
+            WINHTTP_QUERY_RAW_HEADERS_CRLF,
+            PCWSTR::null(),
+            Some(buffer.as_mut_ptr() as *mut c_void),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(map_windows_error)?;
+    buffer.truncate(size as usize / 2);
+
+    let mut headers = HeaderMap::new();
+    // The first line is the status line.
+    for line in buffer.split(|&unit| unit == u16::from(b'\n')).skip(1) {
+        let line = line.strip_suffix(&[u16::from(b'\r')]).unwrap_or(line);
+        let Some(colon) = line.iter().position(|&unit| unit == u16::from(b':')) else {
+            continue;
+        };
+        let name = String::from_utf16_lossy(&line[..colon]);
+        let value = header_bytes(&line[colon + 1..]);
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.trim().as_bytes()),
+            HeaderValue::from_bytes(value.trim_ascii()),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    Ok(headers)
+}
+
+/// Undo WinHTTP's widening of response header bytes: code units up to 0xFF
+/// are the original bytes; anything wider is kept as UTF-8.
+fn header_bytes(units: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(units.len());
+    for c in char::decode_utf16(units.iter().copied()) {
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        if let Ok(byte) = u8::try_from(u32::from(c)) {
+            bytes.push(byte);
+        } else {
+            let mut utf8 = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+        }
+    }
+    bytes
+}
+
+/// The URL the response came from, after redirects.
+fn query_url(handle: *mut c_void) -> Option<url::Url> {
+    let mut size: u32 = 0;
+    let _ = unsafe { WinHttpQueryOption(handle, WINHTTP_OPTION_URL, None, &mut size) };
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    unsafe {
+        WinHttpQueryOption(
+            handle,
+            WINHTTP_OPTION_URL,
+            Some(buffer.as_mut_ptr() as *mut c_void),
+            &mut size,
+        )
+    }
+    .ok()?;
+    let len = buffer
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(buffer.len());
+    url::Url::parse(&String::from_utf16_lossy(&buffer[..len])).ok()
 }

@@ -11,79 +11,85 @@ pub use websocket::{WindowsWebSocket, WindowsWebSocketBuilder};
 
 use crate::backend::types::{BackendRequest, BackendResponse};
 use crate::{Error, Result};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
 /// Windows backend using WinHTTP client
 #[derive(Clone)]
 pub struct WindowsBackend {
-    /// User agent string for HTTP requests
-    user_agent: String,
+    /// The WinHTTP session every request of this backend uses
+    session: Arc<http_client::Session>,
     /// Optional cookie jar for this backend
     cookie_jar: Option<crate::CookieJar>,
     /// Cookie storage using cookie_store
-    cookie_storage: Option<std::sync::Arc<crate::backend::CookieJar>>,
+    cookie_storage: Option<Arc<crate::backend::CookieJar>>,
     /// Default headers to add to all requests
     default_headers: Option<http::HeaderMap>,
-    /// Read (idle) timeout
-    timeout: Option<Duration>,
-    /// Total deadline per request
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
     total_timeout: Option<Duration>,
+    ignore_certificate_errors: bool,
     /// BITS download manager for background downloads
-    bits_manager: Option<std::sync::Arc<BitsDownloadManager>>,
+    bits_manager: Option<Arc<BitsDownloadManager>>,
 }
 
 impl WindowsBackend {
     /// Create a new Windows backend with default configuration
     pub fn new() -> Result<Self> {
-        // Try to create BITS manager, but don't fail if it's not available
-        let bits_manager = BitsDownloadManager::new().ok().map(std::sync::Arc::new);
-
-        Ok(Self {
-            user_agent: "frakt/1.0".to_string(),
-            cookie_jar: None,
-            cookie_storage: None,
-            default_headers: None,
-            timeout: None,
-            total_timeout: None,
-            bits_manager,
-        })
+        Self::with_config(crate::backend::BackendConfig::default())
     }
 
     /// Create a new Windows backend with configuration
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
         // Try to create BITS manager, but don't fail if it's not available
-        let bits_manager = BitsDownloadManager::new().ok().map(std::sync::Arc::new);
+        let bits_manager = BitsDownloadManager::new().ok().map(Arc::new);
 
-        let user_agent = config.user_agent.unwrap_or_else(|| "frakt/1.0".to_string());
+        let user_agent = config.user_agent.as_deref().unwrap_or("frakt/1.0");
+        let proxy = [("http", &config.http_proxy), ("https", &config.https_proxy)]
+            .into_iter()
+            .filter_map(|(scheme, proxy)| {
+                proxy
+                    .as_ref()
+                    .map(|proxy| format!("{}={}:{}", scheme, proxy.host, proxy.port))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let session =
+            http_client::Session::open(user_agent, (!proxy.is_empty()).then_some(proxy.as_str()))?;
 
         // Create cookie storage if cookies are enabled
         let cookie_storage = if config.use_cookies.unwrap_or(false) {
-            Some(std::sync::Arc::new(crate::backend::CookieJar::new()))
+            Some(Arc::new(crate::backend::CookieJar::new()))
         } else {
             None
         };
 
         Ok(Self {
-            user_agent,
+            session: Arc::new(session),
             cookie_jar: config.cookie_jar,
             cookie_storage,
             default_headers: config.default_headers,
-            timeout: config.read_timeout,
+            connect_timeout: config.connect_timeout,
+            read_timeout: config.read_timeout,
             total_timeout: config.timeout,
+            ignore_certificate_errors: config.ignore_certificate_errors.unwrap_or(false),
             bits_manager,
         })
     }
 
     /// Execute an HTTP request using WinHTTP
     pub async fn execute(&self, request: BackendRequest) -> Result<BackendResponse> {
-        // For now, use the http_client module's new WinHTTP implementation
-        http_client::execute_winhttp_request(
+        http_client::execute(
+            http_client::RequestConfig {
+                session: &self.session,
+                default_headers: self.default_headers.as_ref(),
+                cookie_storage: self.cookie_storage.as_ref(),
+                connect_timeout: self.connect_timeout,
+                read_timeout: self.read_timeout,
+                ignore_certificate_errors: self.ignore_certificate_errors,
+            },
             request,
-            &self.user_agent,
-            &self.default_headers,
-            &self.timeout,
-            &self.cookie_storage,
         )
         .await
     }
@@ -121,10 +127,8 @@ impl WindowsBackend {
             url,
             headers, // Use the provided headers
             body: None,
-            progress_callback: progress_callback.map(|cb| {
-                std::sync::Arc::new(cb)
-                    as std::sync::Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>
-            }),
+            progress_callback: progress_callback
+                .map(|cb| Arc::new(cb) as Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>),
             read_timeout: None,
         };
 
