@@ -404,6 +404,7 @@ async fn dropping_the_stream_cancels_the_transfer(backend: BackendType) {
         track.wait_finished(Duration::from_secs(10)).await,
         "the server was still sending 10 s after the stream was dropped"
     );
+    let closed_after = dropped.elapsed();
     assert!(
         track.closed_early.load(Ordering::SeqCst),
         "the whole body was sent after the stream was dropped"
@@ -414,7 +415,7 @@ async fn dropping_the_stream_cancels_the_transfer(backend: BackendType) {
     println!(
         "{:?}: connection closed {:?} after drop, {:.1} MiB sent in total, RSS grew {:.1} MiB after drop",
         backend,
-        dropped.elapsed(),
+        closed_after,
         written as f64 / MIB as f64,
         rss_growth as f64 / MIB as f64
     );

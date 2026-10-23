@@ -35,8 +35,8 @@ fn cpu_time() -> Duration {
     Duration::ZERO
 }
 
+#[allow(unused_mut, clippy::vec_init_then_push)]
 fn backends() -> Vec<BackendType> {
-    #[allow(unused_mut)]
     let mut backends = Vec::new();
     #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
     backends.push(BackendType::Foundation);
@@ -103,4 +103,5 @@ async fn main() {
     }
 
     let _ = child.kill();
+    let _ = child.wait();
 }
