@@ -630,8 +630,8 @@ async fn timeouts(backend: BackendType) {
     let server = Server::start().await;
     let short = client_with(backend, |b| b.read_timeout(Duration::from_secs(1)));
 
-    // The body stalls longer than the read timeout.
-    let started = Instant::now();
+    // The body stalls longer than the read timeout. Only the body is
+    // timed: connection setup is not what this checks.
     let response = short
         .get(
             server
@@ -642,6 +642,7 @@ async fn timeouts(backend: BackendType) {
         .send()
         .await
         .unwrap();
+    let started = Instant::now();
     match drain(response).await {
         Err((_, Error::Timeout)) => {}
         other => panic!("stalled body: {:?}", other.map(|(n, _)| n)),
