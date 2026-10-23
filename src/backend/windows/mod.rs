@@ -30,8 +30,6 @@ pub struct WindowsBackend {
     read_timeout: Option<Duration>,
     total_timeout: Option<Duration>,
     ignore_certificate_errors: bool,
-    /// BITS download manager for background downloads
-    bits_manager: Option<Arc<BitsDownloadManager>>,
 }
 
 impl WindowsBackend {
@@ -42,9 +40,6 @@ impl WindowsBackend {
 
     /// Create a new Windows backend with configuration
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
-        // Try to create BITS manager, but don't fail if it's not available
-        let bits_manager = BitsDownloadManager::new().ok().map(Arc::new);
-
         let user_agent = config.user_agent.as_deref().unwrap_or("frakt/1.0");
         let proxy = [("http", &config.http_proxy), ("https", &config.https_proxy)]
             .into_iter()
@@ -74,7 +69,6 @@ impl WindowsBackend {
             read_timeout: config.read_timeout,
             total_timeout: config.timeout,
             ignore_certificate_errors: config.ignore_certificate_errors.unwrap_or(false),
-            bits_manager,
         })
     }
 
@@ -104,8 +98,12 @@ impl WindowsBackend {
         progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
         _error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
-        // Try BITS first if available, fall back to regular download
-        if let Some(ref bits_manager) = self.bits_manager {
+        // Try BITS first if available, fall back to regular download.
+        // The BITS manager is created here rather than kept in the backend:
+        // its COM interface is neither Send nor Sync, which made every
+        // client and request future !Send, and creating it initialises COM
+        // on the calling thread.
+        if let Ok(bits_manager) = BitsDownloadManager::new() {
             // For now, disable progress callbacks with BITS to avoid lifetime issues
             // TODO: Fix progress callback lifetime management
             // TODO: Pass headers to BITS manager when it supports them
@@ -115,10 +113,7 @@ impl WindowsBackend {
             {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    eprintln!(
-                        "BITS download failed, falling back to regular download: {}",
-                        e
-                    );
+                    tracing::warn!("BITS download failed, falling back to WinHTTP: {}", e);
                 }
             }
         }
