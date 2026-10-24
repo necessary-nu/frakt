@@ -58,12 +58,12 @@ impl<'a, 'e> UrlRequestBuilder<'a, 'e> {
     /// Add a header that `addHeader` would refuse.
     ///
     /// Cronet's `addHeader` silently drops `Accept-Encoding`
-    /// (crbug.com/581399) and always asks for compressed bodies, which it then
-    /// decodes, so `Content-Length` and `Content-Range` no longer describe the
-    /// bytes delivered. This appends to the builder's private header list
-    /// instead; Chromium only adds its own `Accept-Encoding` when none is set.
-    /// Returns `Ok(false)`, leaving Cronet's default, if the Cronet
-    /// implementation has no such list.
+    /// (crbug.com/581399), so a caller's explicit `identity`, and the one
+    /// frakt adds to Range requests, would be replaced by Cronet's own
+    /// `gzip, deflate` and the body decoded. This appends to the builder's
+    /// private header list instead; Chromium only adds its own
+    /// `Accept-Encoding` when none is set. Returns `Ok(false)`, leaving
+    /// Cronet's default, if the Cronet implementation has no such list.
     pub fn force_header(&mut self, name: &str, value: &str) -> Result<bool, jni::errors::Error> {
         let headers =
             match self

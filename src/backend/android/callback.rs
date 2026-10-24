@@ -11,7 +11,7 @@
 //! thread or the consumer's thread issues it, whichever frees room first;
 //! `Inner::read_outstanding` keeps it to one at a time, as Cronet requires.
 
-use crate::backend::types::ProgressCallback;
+use crate::backend::types::{BodyAccounting, ProgressCallback};
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
@@ -47,6 +47,22 @@ pub(crate) struct Inner {
     /// Bumped on every sign of progress, so idle timers can tell a quiet
     /// transfer from a slow one.
     pub activity: u64,
+    /// Filled in from the response head; see `body_accounting`.
+    pub accounting: Option<Arc<BodyAccounting>>,
+    /// `UrlResponseInfo.getReceivedByteCount()` when the response started,
+    /// if the difference to later counts is exactly the body's wire bytes.
+    pub wire_baseline: Option<i64>,
+}
+
+impl Inner {
+    /// Update the wire count from a later `getReceivedByteCount()`.
+    fn record_received(&self, received: Option<i64>) {
+        if let (Some(accounting), Some(baseline), Some(received)) =
+            (&self.accounting, self.wire_baseline, received)
+        {
+            accounting.set_wire_bytes(received.saturating_sub(baseline).max(0) as u64);
+        }
+    }
 }
 
 /// State shared by one request's callbacks and its Rust-side owner.
@@ -204,6 +220,72 @@ fn extract_headers(env: &mut JNIEnv, info: &JObject) -> Result<HeaderMap> {
     Ok(headers)
 }
 
+/// How the body relates to the wire, from the response head.
+///
+/// Cronet decodes gzip and deflate itself (it asks for nothing else unless
+/// told to) and keeps Content-Encoding and Content-Length as the server
+/// sent them. `getReceivedByteCount()` is documented as counting bytes
+/// before decompression, headers and redirects included; measured on
+/// Cronet 141, at `onResponseStarted` it is exactly the bytes of every
+/// response head so far, even when the server sent body bytes in the same
+/// packet, so later counts minus it are the body bytes read from the
+/// connection. That is the wire count for HTTP/1.x without chunked
+/// framing; chunk headers and HTTP/2 or QUIC frames would be counted too,
+/// so no wire count is kept for those.
+fn body_accounting(
+    env: &mut JNIEnv,
+    info: &JObject,
+    headers: &HeaderMap,
+    received: Option<i64>,
+) -> (Arc<BodyAccounting>, Option<i64>) {
+    let decoded = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            let coding = coding.trim();
+            ["gzip", "x-gzip", "deflate"]
+                .iter()
+                .any(|known| coding.eq_ignore_ascii_case(known))
+        });
+    let accounting = BodyAccounting::new(decoded, crate::backend::types::content_length(headers));
+
+    let chunked = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .any(|value| {
+            value
+                .as_bytes()
+                .to_ascii_lowercase()
+                .windows(7)
+                .any(|w| w == b"chunked")
+        });
+    let protocol = env
+        .call_method(info, "getNegotiatedProtocol", "()Ljava/lang/String;", &[])
+        .and_then(|v| v.l())
+        .ok()
+        .and_then(|protocol| java_string(env, &protocol))
+        .unwrap_or_default();
+    let _ = env.exception_clear();
+    // Plain-text HTTP/1.x reports "unknown"; TLS reports the ALPN name.
+    let http1 = matches!(protocol.as_str(), "unknown" | "" | "http/1.1" | "http/1.0");
+    let baseline = received.filter(|_| http1 && !chunked);
+    if baseline.is_some() {
+        accounting.set_wire_bytes(0);
+    }
+    (accounting, baseline)
+}
+
+fn received_byte_count(env: &mut JNIEnv, info: &JObject) -> Option<i64> {
+    let count = env
+        .call_method(info, "getReceivedByteCount", "()J", &[])
+        .and_then(|v| v.j())
+        .ok();
+    let _ = env.exception_clear();
+    count
+}
+
 fn extract_head(env: &mut JNIEnv, info: &JObject) -> Result<ResponseHead> {
     let code = env
         .call_method(info, "getHttpStatusCode", "()I", &[])
@@ -324,9 +406,13 @@ extern "system" fn native_on_response_started(
     let Some(shared) = lookup(handler_id) else {
         return;
     };
+    let received = received_byte_count(&mut env, &info);
     match extract_head(&mut env, &info) {
         Ok(head) => {
+            let (accounting, baseline) = body_accounting(&mut env, &info, &head.headers, received);
             let read = shared.update(|inner| {
+                inner.accounting = Some(accounting);
+                inner.wire_baseline = baseline;
                 inner.head = Some(head);
                 inner.activity += 1;
                 let read = inner.finished.is_none() && !inner.read_outstanding;
@@ -346,13 +432,14 @@ extern "system" fn native_on_read_completed(
     _this: JObject,
     handler_id: jlong,
     _request: JObject,
-    _info: JObject,
+    info: JObject,
     buffer: JObject,
     length: jint,
 ) {
     let Some(shared) = lookup(handler_id) else {
         return;
     };
+    let received = received_byte_count(&mut env, &info);
     let buffer = JByteBuffer::from(buffer);
     let chunk = match env.get_direct_buffer_address(&buffer) {
         Ok(address) if length > 0 => {
@@ -370,6 +457,7 @@ extern "system" fn native_on_read_completed(
     };
     let read = shared.update(|inner| {
         inner.activity += 1;
+        inner.record_received(received);
         if !chunk.is_empty() {
             inner.chunks.push_back(chunk);
         }
@@ -383,13 +471,16 @@ extern "system" fn native_on_read_completed(
 }
 
 extern "system" fn native_on_succeeded(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _this: JObject,
     handler_id: jlong,
     _request: JObject,
-    _info: JObject,
+    info: JObject,
 ) {
     if let Some(shared) = lookup(handler_id) {
+        let received = received_byte_count(&mut env, &info);
+        // The count must be final before the body can end.
+        shared.update(|inner| inner.record_received(received));
         shared.finish(Ok(()));
     }
     unregister(handler_id);
@@ -400,11 +491,13 @@ extern "system" fn native_on_failed(
     _this: JObject,
     handler_id: jlong,
     _request: JObject,
-    _info: JObject,
+    info: JObject,
     exception: JObject,
 ) {
     if let Some(shared) = lookup(handler_id) {
+        let received = received_byte_count(&mut env, &info);
         let error = cronet_error(&mut env, &exception);
+        shared.update(|inner| inner.record_received(received));
         tracing::debug!("Cronet request {} failed: {}", handler_id, error);
         shared.finish(Err(error));
     }

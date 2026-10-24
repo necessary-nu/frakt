@@ -2,7 +2,7 @@
 
 use super::callback::{self, MAX_QUEUED_CHUNKS, READ_BUFFER_SIZE, RequestShared, java_error};
 use super::jni_bindings::UrlRequestBuilder;
-use crate::backend::types::{BackendRequest, BackendResponse};
+use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::Stream;
@@ -80,12 +80,16 @@ pub async fn execute_request(
     }
 
     let mut idle = IdleTimer::new(read_timeout);
-    let (head, redirect_headers) = std::future::poll_fn(|cx| {
+    let (head, redirect_headers, accounting) = std::future::poll_fn(|cx| {
         let activity = {
             let mut inner = shared.inner.lock().unwrap();
             if let Some(head) = inner.head.take() {
                 let redirects = std::mem::take(&mut inner.redirect_headers);
-                return Poll::Ready(Ok((head, redirects)));
+                let accounting = inner
+                    .accounting
+                    .clone()
+                    .unwrap_or_else(|| BodyAccounting::undecoded(&head.headers));
+                return Poll::Ready(Ok((head, redirects, accounting)));
             }
             if let Some(result) = inner.finished.as_mut() {
                 let error = match std::mem::replace(result, Ok(())) {
@@ -104,11 +108,6 @@ pub async fn execute_request(
     })
     .await?;
 
-    // Cronet decodes gzip, deflate and br bodies itself.
-    let accounting = crate::backend::types::BodyAccounting::new(
-        crate::backend::types::has_content_coding(&head.headers),
-        crate::backend::types::content_length(&head.headers),
-    );
     Ok(BackendResponse {
         status: head.status,
         accounting,
