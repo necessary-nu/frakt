@@ -20,6 +20,7 @@ use objc2_foundation::{
     NSURLCredentialPersistence, NSURLResponse, NSURLSession, NSURLSessionAuthChallengeDisposition,
     NSURLSessionDataDelegate, NSURLSessionDataTask, NSURLSessionDelegate,
     NSURLSessionResponseDisposition, NSURLSessionTask, NSURLSessionTaskDelegate,
+    NSURLSessionTaskMetrics,
 };
 use objc2_security::SecTrust;
 use url::Url;
@@ -52,6 +53,10 @@ struct Inner {
     waker: Option<Waker>,
     /// The owner cancelled the task; data still in flight is dropped.
     discarded: bool,
+    /// countOfResponseBodyBytesReceived of the last transaction: body bytes
+    /// as received, before content decoding but including any chunk
+    /// framing. NSURLSession reports metrics before completion.
+    raw_body_bytes: Option<u64>,
     /// Last time the network made progress: data sent or received, or the
     /// task resumed.
     last_activity: Instant,
@@ -83,6 +88,7 @@ impl DataTaskState {
                 outcome: None,
                 waker: None,
                 discarded: false,
+                raw_body_bytes: None,
                 last_activity: Instant::now(),
             }),
             progress,
@@ -127,6 +133,15 @@ impl DataTaskState {
             task.suspend();
         }
         inner.wake();
+    }
+
+    fn on_metrics(&self, raw_body_bytes: u64) {
+        self.lock().raw_body_bytes = Some(raw_body_bytes);
+    }
+
+    /// The last transaction's received body bytes, once metrics arrived.
+    pub(crate) fn raw_body_bytes(&self) -> Option<u64> {
+        self.lock().raw_body_bytes
     }
 
     fn on_complete(&self, outcome: Result<()>) {
@@ -220,6 +235,24 @@ define_class!(
                     Some(error) => Err(Error::from_ns_error(error)),
                     None => Ok(()),
                 });
+            }
+        }
+
+        #[unsafe(method(URLSession:task:didFinishCollectingMetrics:))]
+        fn URLSession_task_didFinishCollectingMetrics(
+            &self,
+            _session: &NSURLSession,
+            task: &NSURLSessionTask,
+            metrics: &NSURLSessionTaskMetrics,
+        ) {
+            if let Some(state) = self.get(task.taskIdentifier()) {
+                let transactions = metrics.transactionMetrics();
+                if let Some(last) = transactions.count().checked_sub(1) {
+                    let received = transactions
+                        .objectAtIndex(last)
+                        .countOfResponseBodyBytesReceived();
+                    state.on_metrics(received.max(0) as u64);
+                }
             }
         }
 

@@ -18,7 +18,7 @@ pub use websocket::{FoundationWebSocket, FoundationWebSocketBuilder};
 /// Foundation error handling
 pub mod error;
 
-use crate::backend::types::{BackendRequest, BackendResponse};
+use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting, BodyIntegrity};
 use crate::{Error, Result};
 use bytes::Bytes;
 use delegate::data_task::{DataTaskDelegate, DataTaskState, ResponseHead, header_value_string};
@@ -179,11 +179,9 @@ impl FoundationBackend {
         let mut body = objc2::rc::autoreleasepool(|_| self.start(request))?;
         let head = std::future::poll_fn(|cx| body.poll_head(cx)).await?;
 
-        // CFNetwork decodes gzip, deflate and br bodies itself.
-        let accounting = crate::backend::types::BodyAccounting::new(
-            crate::backend::types::has_content_coding(&head.headers),
-            crate::backend::types::content_length(&head.headers),
-        );
+        let accounting = foundation_accounting(&head.headers);
+        body.accounting = Some(accounting.clone());
+        body.chunked = dechunked(&head.headers);
         Ok(BackendResponse {
             status: head.status,
             headers: head.headers,
@@ -261,6 +259,8 @@ impl FoundationBackend {
             task,
             _session: self.session.clone(),
             finished: false,
+            accounting: None,
+            chunked: false,
             read_timeout: request.read_timeout.or(self.read_timeout),
             idle: None,
             waiting_since: None,
@@ -391,6 +391,10 @@ struct FoundationBody {
     task: Retained<NSURLSessionDataTask>,
     _session: Arc<Session>,
     finished: bool,
+    accounting: Option<Arc<BodyAccounting>>,
+    /// CFNetwork removed chunked framing, so its raw byte count includes
+    /// framing and is not the wire length.
+    chunked: bool,
     read_timeout: Option<Duration>,
     idle: Option<Pin<Box<Sleep>>>,
     /// When the owner started waiting for the current head or chunk.
@@ -452,6 +456,13 @@ impl Stream for FoundationBody {
                 if matches!(item, None | Some(Err(_))) {
                     self.finished = true;
                 }
+                if item.is_none() && !self.chunked {
+                    if let (Some(accounting), Some(raw)) =
+                        (&self.accounting, self.state.raw_body_bytes())
+                    {
+                        accounting.set_wire_bytes(raw);
+                    }
+                }
                 Poll::Ready(item)
             }
             Poll::Pending => self.poll_read_timeout(cx).map(|error| Some(Err(error))),
@@ -466,6 +477,50 @@ impl Drop for FoundationBody {
             self.state.discard();
         }
     }
+}
+
+/// What CFNetwork tells us about a body, from its response headers.
+///
+/// CFNetwork decodes gzip, deflate and br and keeps the Content-Length of
+/// the encoded body, which it checks: a short body fails with
+/// NSURLErrorNetworkConnectionLost. Without a Content-Length it takes a
+/// clean close of the connection as the end of the body, for chunked
+/// HTTP/1.1 and for HTTP/2 streams alike (only a reset is reported), so
+/// such bodies are unverifiable.
+fn foundation_accounting(headers: &http::HeaderMap) -> Arc<BodyAccounting> {
+    let decoded = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().is_ok_and(|v| {
+                v.split(',').any(|c| {
+                    matches!(
+                        c.trim().to_ascii_lowercase().as_str(),
+                        "gzip" | "x-gzip" | "deflate" | "br"
+                    )
+                })
+            })
+        });
+    let length = crate::backend::types::content_length(headers);
+    let accounting = BodyAccounting::new(decoded, length);
+    accounting.set_integrity(if length.is_some() {
+        BodyIntegrity::Checked
+    } else {
+        BodyIntegrity::Unverifiable
+    });
+    accounting
+}
+
+/// Whether CFNetwork removed chunked framing, which it reports by
+/// rewriting `Transfer-Encoding: chunked` to `Transfer-Encoding: Identity`.
+fn dechunked(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .any(|value| {
+            value.as_bytes().eq_ignore_ascii_case(b"identity")
+                || value.as_bytes().eq_ignore_ascii_case(b"chunked")
+        })
 }
 
 /// The Content-Type a body implies and its encoded bytes.
