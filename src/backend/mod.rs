@@ -61,6 +61,10 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// unless the caller (on the request or as a client default header) set
 /// `Accept-Encoding` itself, because a byte range of a decoded body means
 /// nothing. An explicit `Accept-Encoding: identity` is honoured everywhere.
+/// With any other explicit `Accept-Encoding`, Foundation and Cronet still
+/// decode, reqwest decodes gzip, deflate and br, and WinHTTP delivers the
+/// body as the server encoded it (it would otherwise rewrite the header);
+/// `is_decoded()` tells which happened.
 ///
 /// [`Response::is_decoded`]: crate::Response::is_decoded
 /// [`Response::body_stats`]: crate::Response::body_stats

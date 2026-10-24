@@ -13,7 +13,9 @@
 //! - The connection handle belongs to the context, so it is closed only after
 //!   the request handle has finished closing.
 
-use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting, channel_body};
+use crate::backend::types::{
+    BackendRequest, BackendResponse, BodyAccounting, BodyIntegrity, channel_body,
+};
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -415,6 +417,11 @@ pub(crate) async fn execute(
     };
 
     let accounting = BodyAccounting::new(decoded, content_length);
+    if decoded {
+        // The stripped headers hide the framing, but WinHTTP checks it and
+        // fails a cut compressed body (12152) with either framing.
+        accounting.set_integrity(BodyIntegrity::Checked);
+    }
     let (tx, rx) = mpsc::channel(BODY_CHANNEL_CHUNKS);
     tokio::spawn(read_body(
         BodyReader {
