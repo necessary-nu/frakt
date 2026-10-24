@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::backend::types::{BackendResponse, BodyAccounting, BodyStream};
+use crate::backend::types::{BackendResponse, BodyAccounting, BodyIntegrity, BodyStream};
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
@@ -48,6 +48,17 @@ impl Response {
             || status.is_informational()
             || status == StatusCode::NO_CONTENT
             || status == StatusCode::NOT_MODIFIED);
+        if backend_response.accounting.integrity().is_none() {
+            let framed = crate::backend::types::content_length(&backend_response.headers).is_some()
+                || crate::backend::types::is_chunked(&backend_response.headers);
+            backend_response
+                .accounting
+                .set_integrity(if framed || !has_body {
+                    BodyIntegrity::Checked
+                } else {
+                    BodyIntegrity::Unverifiable
+                });
+        }
         Self {
             status,
             headers: backend_response.headers,
@@ -77,6 +88,20 @@ impl Response {
     /// see it.
     pub fn expected_wire_length(&self) -> Option<u64> {
         self.body.expected_wire_length()
+    }
+
+    /// Whether a body cut short by the connection closing would be
+    /// reported as an error. See
+    /// [`RequestBuilder::require_checked_body`](crate::RequestBuilder::require_checked_body)
+    /// to refuse responses for which it would not.
+    pub fn body_integrity(&self) -> BodyIntegrity {
+        if !self.body.has_body {
+            return BodyIntegrity::Checked;
+        }
+        self.body
+            .accounting
+            .integrity()
+            .unwrap_or(BodyIntegrity::Unverifiable)
     }
 
     /// Bytes counted so far; see [`BodyStats`].

@@ -121,6 +121,7 @@ pub struct DownloadBuilder {
     headers: HeaderMap,
     progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
     error_for_status: bool,
+    require_checked_body: bool,
 }
 
 impl DownloadBuilder {
@@ -133,7 +134,15 @@ impl DownloadBuilder {
             headers: HeaderMap::new(),
             progress_callback: None,
             error_for_status: true,
+            require_checked_body: false,
         }
+    }
+
+    /// Refuse a response whose body could be cut short without an error;
+    /// see [`RequestBuilder::require_checked_body`](crate::RequestBuilder::require_checked_body).
+    pub fn require_checked_body(mut self) -> Self {
+        self.require_checked_body = true;
+        self
     }
 
     /// Set a progress callback to monitor download progress.
@@ -395,6 +404,9 @@ impl DownloadBuilder {
         let mut request_builder =
             crate::RequestBuilder::new(http::Method::GET, self.url, self.backend)
                 .allow_error_status();
+        if self.require_checked_body {
+            request_builder = request_builder.require_checked_body();
+        }
 
         // Add headers to the request
         for (name, value) in &self.headers {

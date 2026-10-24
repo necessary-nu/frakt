@@ -70,6 +70,20 @@ pub struct BodyAccounting {
     expected_wire_length: Option<u64>,
     wire_bytes: AtomicU64,
     wire_counted: AtomicBool,
+    integrity: std::sync::OnceLock<BodyIntegrity>,
+}
+
+/// Whether a body cut off by a closed connection is reported as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyIntegrity {
+    /// The body's end is checked: against Content-Length, the chunked
+    /// terminator or the stream's end marker. A body cut short is an error.
+    Checked,
+    /// Nothing distinguishes the whole body from one cut short by the
+    /// connection closing cleanly: a body delimited only by the connection
+    /// closing, or one the backend's stack does not check (on Foundation,
+    /// any body without Content-Length).
+    Unverifiable,
 }
 
 impl BodyAccounting {
@@ -83,7 +97,20 @@ impl BodyAccounting {
             expected_wire_length,
             wire_bytes: AtomicU64::new(0),
             wire_counted: AtomicBool::new(false),
+            integrity: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Say whether the stack checks this body's end. Without it, a body is
+    /// taken as checked if it has a Content-Length or chunked framing,
+    /// which stacks other than Foundation check.
+    pub fn set_integrity(&self, integrity: BodyIntegrity) {
+        let _ = self.integrity.set(integrity);
+    }
+
+    /// The integrity the backend set, if it set one.
+    pub fn integrity(&self) -> Option<BodyIntegrity> {
+        self.integrity.get().copied()
     }
 
     /// For a body delivered exactly as sent: its Content-Length, if any, is
@@ -131,6 +158,19 @@ pub fn content_length(headers: &HeaderMap) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Whether the headers say the body was sent with chunked framing.
+pub fn is_chunked(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().is_ok_and(|v| {
+                v.split(',')
+                    .any(|c| c.trim().eq_ignore_ascii_case("chunked"))
+            })
+        })
 }
 
 /// Whether the headers name a content coding other than identity.

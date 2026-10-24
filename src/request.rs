@@ -19,6 +19,7 @@ pub struct Request {
     pub(crate) error_for_status: bool,
     pub(crate) timeout: Option<Duration>,
     pub(crate) read_timeout: Option<Duration>,
+    pub(crate) require_checked_body: bool,
 }
 
 impl Request {
@@ -65,6 +66,12 @@ impl Request {
             return Err(crate::Error::HttpError(Box::new(response)));
         }
 
+        if self.require_checked_body
+            && response.body_integrity() == crate::BodyIntegrity::Unverifiable
+        {
+            return Err(crate::Error::UnverifiableBody(Box::new(response)));
+        }
+
         Ok(response)
     }
 }
@@ -80,6 +87,7 @@ pub struct RequestBuilder {
     error_for_status: bool,
     timeout: Option<Duration>,
     read_timeout: Option<Duration>,
+    require_checked_body: bool,
 }
 
 impl RequestBuilder {
@@ -94,6 +102,7 @@ impl RequestBuilder {
             error_for_status: true,
             timeout: None,
             read_timeout: None,
+            require_checked_body: false,
         }
     }
 
@@ -178,6 +187,21 @@ impl RequestBuilder {
         self
     }
 
+    /// Refuse a response whose body could be cut short without an error.
+    ///
+    /// When set, `send` fails with
+    /// [`Error::UnverifiableBody`](crate::Error::UnverifiableBody) (holding
+    /// the unread response) if [`Response::body_integrity`](crate::Response::body_integrity)
+    /// is `Unverifiable`: the body has no Content-Length and the backend
+    /// cannot check its framing, which on Foundation is every body without
+    /// Content-Length, chunked or HTTP/2 alike, because CFNetwork treats a
+    /// cleanly closed connection as the end of such a body. Use it for
+    /// downloads that must be whole.
+    pub fn require_checked_body(mut self) -> Self {
+        self.require_checked_body = true;
+        self
+    }
+
     /// Configure whether to return an error for HTTP error status codes (>= 400).
     ///
     /// When enabled (the default), responses with status codes >= 400 will return
@@ -249,6 +273,7 @@ impl RequestBuilder {
             error_for_status: self.error_for_status,
             timeout: self.timeout,
             read_timeout: self.read_timeout,
+            require_checked_body: self.require_checked_body,
         };
         request.send().await
     }

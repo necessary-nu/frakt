@@ -231,6 +231,7 @@
 // Multi-platform support via backend abstraction
 
 pub use auth::Auth;
+pub use backend::types::BodyIntegrity;
 pub use client::{
     BackendType, BackgroundDownloadBuilder, Client, ClientBuilder, DownloadBuilder,
     DownloadResponse, UploadBuilder,
