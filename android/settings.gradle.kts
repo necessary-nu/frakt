@@ -1,5 +1,5 @@
-// The Android side of frakt's background downloads: frakt-background,
-// which host apps include.
+// The Android side of frakt's background downloads (frakt-background, which
+// host apps include) and the app that exercises it on a device (bgtest).
 pluginManagement {
     repositories {
         google()
@@ -16,4 +16,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "frakt-android"
-include(":frakt-background")
+include(":frakt-background", ":bgtest")

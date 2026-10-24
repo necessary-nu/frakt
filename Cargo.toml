@@ -137,6 +137,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 flate2 = "1"
 memory-stats = "1"
 
+# The native half of android/bgtest, the app that exercises background
+# downloads on a device.
+[[example]]
+name = "android_bg_harness"
+crate-type = ["cdylib"]
+required-features = ["backend-android"]
+
 [features]
 default = ["backend-reqwest"]
 backend-reqwest = ["dep:reqwest", "tokio-tungstenite", "dep:rustls", "dep:async-compression", "dep:tokio-util"]
