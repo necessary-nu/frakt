@@ -106,10 +106,6 @@ fn body_bounds(response: frakt::Response) {
     assert_send(&stream);
 }
 
-fn is_foundation(backend: BackendType) -> bool {
-    format!("{:?}", backend) == "Foundation"
-}
-
 fn rss() -> u64 {
     memory_stats::memory_stats()
         .map(|stats| stats.physical_mem as u64)
@@ -357,35 +353,59 @@ async fn mid_body_drop_is_an_error(backend: BackendType) {
     let _serial = SERIAL.lock().await;
     let server = Server::start().await;
     let client = client(backend);
+    let len = 4 * MIB;
 
-    for chunked in [false, true] {
-        let url = server.url(&format!(
-            "/truncate?len={}&after={}&chunked={}",
-            4 * MIB,
-            MIB,
-            chunked as u8
-        ));
+    // Complete chunked bodies, which the cases below must not be confused
+    // with, end cleanly with every byte.
+    for keepalive in [0, 1] {
+        let url = server.url(&format!("/chunked?len={}&keepalive={}", len, keepalive));
+        let response = client.get(url.as_str()).unwrap().send().await.unwrap();
+        let (total, hash) = drain(response).await.unwrap_or_else(|(n, e)| {
+            panic!(
+                "complete chunked body (keep-alive {}) failed after {} bytes: {}",
+                keepalive, n, e
+            )
+        });
+        assert_eq!(total, len);
+        assert_eq!(hash, server::body_hash(1, 0, len));
+    }
+
+    let cases = [
+        (
+            "Content-Length",
+            format!("/truncate?len={}&after={}&chunked=0", len, MIB),
+        ),
+        (
+            "chunked, close, FIN",
+            format!("/chunked?len={}&cut={}", len, MIB),
+        ),
+        (
+            "chunked, keep-alive, FIN",
+            format!("/chunked?len={}&cut={}&keepalive=1", len, MIB),
+        ),
+        (
+            "chunked, close, RST",
+            format!("/chunked?len={}&cut={}&rst=1", len, MIB),
+        ),
+        (
+            "chunked, keep-alive, RST",
+            format!("/chunked?len={}&cut={}&keepalive=1&rst=1", len, MIB),
+        ),
+    ];
+    for (case, path) in &cases {
+        let url = server.url(path);
 
         // A stack may notice the drop before it hands over the response;
         // failing send() is as good as failing the body.
         match client.get(url.as_str()).unwrap().send().await {
             Err(error) => println!(
-                "{:?}: truncated (chunked: {}) failed before the body: {}",
-                backend, chunked, error
+                "{:?}: truncated ({}) failed before the body: {}",
+                backend, case, error
             ),
             Ok(response) => match drain(response).await {
-                Ok((total, _)) if chunked && is_foundation(backend) => {
-                    // CFNetwork reports a chunked body whose connection closes
-                    // before the last chunk as complete, with or without
-                    // keep-alive, and exposes nothing that tells the two apart.
-                    println!(
-                        "{:?}: KNOWN LIMITATION: truncated chunked body ended cleanly after {} bytes",
-                        backend, total
-                    );
-                }
                 Ok((total, _)) => panic!(
-                    "truncated body (chunked: {}) ended cleanly after {} bytes",
-                    chunked, total
+                    "truncated body ({}) ended cleanly after {} bytes",
+                    case, total
                 ),
                 Err((total, error)) => {
                     assert!(
@@ -393,21 +413,18 @@ async fn mid_body_drop_is_an_error(backend: BackendType) {
                         "read {} bytes of a 1 MiB truncated body",
                         total
                     );
-                    println!("{:?}: truncated (chunked: {}): {}", backend, chunked, error);
+                    println!("{:?}: truncated ({}): {}", backend, case, error);
                 }
             },
         }
 
-        if chunked && is_foundation(backend) {
-            continue;
-        }
         if let Ok(response) = client.get(url.as_str()).unwrap().send().await {
             let mut reader = response.stream();
             let result = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
             assert!(
                 result.is_err(),
-                "AsyncRead reported a clean end of a truncated body (chunked: {}): {:?}",
-                chunked,
+                "AsyncRead reported a clean end of a truncated body ({}): {:?}",
+                case,
                 result
             );
         }
@@ -488,31 +505,167 @@ async fn identity_encoding_is_honoured(backend: BackendType) {
     let _serial = SERIAL.lock().await;
     let server = Server::start().await;
     let client = client(backend);
+    let len = MIB as usize;
 
-    for explicit in [false, true] {
-        let id = if explicit { "explicit" } else { "default" };
-        let mut request = client
-            .get(server.url(&format!("/encoded?id={}", id)).as_str())
+    // An explicit identity gets the body as stored.
+    let response = client
+        .get(
+            server
+                .url(&format!("/gzip?len={}&id=explicit", len))
+                .as_str(),
+        )
+        .unwrap()
+        .header("Accept-Encoding", "identity")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.is_decoded());
+    assert!(response.headers().get("content-encoding").is_none());
+    assert_eq!(header(&response, "content-length"), len.to_string());
+    assert_eq!(response.expected_wire_length(), Some(len as u64));
+    let mut stream = response.stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(body, server::text_body(len));
+    let stats = stream.stats();
+    assert_eq!(stats.delivered_bytes, len as u64);
+    if let Some(wire) = stats.wire_bytes {
+        assert_eq!(wire, len as u64);
+    }
+    let seen = server.requests_with_id("explicit");
+    assert_eq!(
+        seen[0].header_str("accept-encoding").as_deref(),
+        Some("identity")
+    );
+
+    // A Range request without an explicit Accept-Encoding goes out as
+    // identity, so the range addresses the stored bytes.
+    let response = client
+        .get(server.url("/bytes?len=100000&id=range").as_str())
+        .unwrap()
+        .header("Range", "bytes=1000-")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 206);
+    assert!(!response.is_decoded());
+    drop(response);
+    let seen = server.requests_with_id("range");
+    assert_eq!(
+        seen[0].header_str("accept-encoding").as_deref(),
+        Some("identity"),
+        "Range request"
+    );
+
+    // An explicit choice on a Range request is left alone.
+    let response = client
+        .get(server.url("/bytes?len=100000&id=range-gzip").as_str())
+        .unwrap()
+        .header("Range", "bytes=1000-")
+        .unwrap()
+        .header("Accept-Encoding", "gzip")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 206);
+    drop(response);
+    let seen = server.requests_with_id("range-gzip");
+    let accept = seen[0].header_str("accept-encoding").unwrap_or_default();
+    assert!(
+        accept.contains("gzip"),
+        "Range request with explicit gzip sent {:?}",
+        accept
+    );
+}
+
+async fn compressed_bodies_are_decoded_and_counted(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+    let len = 4 * MIB as usize;
+    let wire_len = server::gzip_body(len).len() as u64;
+
+    for chunked in [false, true] {
+        let id = format!("compressed-{}", chunked as u8);
+        let response = client
+            .get(
+                server
+                    .url(&format!(
+                        "/gzip?len={}&chunked={}&id={}",
+                        len, chunked as u8, id
+                    ))
+                    .as_str(),
+            )
+            .unwrap()
+            .send()
+            .await
             .unwrap();
-        if explicit {
-            request = request.header("Accept-Encoding", "identity").unwrap();
+        let accept = server.requests_with_id(&id)[0]
+            .header_str("accept-encoding")
+            .unwrap_or_default();
+        assert!(
+            accept.contains("gzip"),
+            "default request sent Accept-Encoding {:?}",
+            accept
+        );
+        assert!(response.is_decoded(), "gzip body not reported as decoded");
+        if chunked {
+            assert_eq!(response.expected_wire_length(), None);
+        } else if let Some(expected) = response.expected_wire_length() {
+            assert_eq!(expected, wire_len);
         }
-        let response = request.send().await.unwrap();
-        assert!(response.headers().get("content-encoding").is_none());
-        assert_eq!(
-            header(&response, "content-length"),
-            server::ENCODED_TEXT.len().to_string()
-        );
-        assert_eq!(response.text().await.unwrap(), server::ENCODED_TEXT);
 
-        let seen = server.requests_with_id(id);
-        assert_eq!(seen.len(), 1);
-        assert_eq!(
-            seen[0].header_str("accept-encoding").as_deref(),
-            Some("identity"),
-            "{} request",
-            id
+        let mut stream = response.stream();
+        let mut hasher = blake3::Hasher::new();
+        while let Some(chunk) = stream.next().await {
+            hasher.update(&chunk.unwrap());
+        }
+        assert_eq!(hasher.finalize(), blake3::hash(&server::text_body(len)));
+        let stats = stream.stats();
+        assert_eq!(stats.delivered_bytes, len as u64);
+        if let Some(wire) = stats.wire_bytes {
+            assert_eq!(wire, wire_len, "wire bytes (chunked: {})", chunked);
+        }
+        println!(
+            "{:?}: gzip {} -> {} bytes (chunked: {}): {:?}",
+            backend, wire_len, len, chunked, stats
         );
+    }
+}
+
+async fn compressed_body_cut_short_is_an_error(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+    let len = 4 * MIB as usize;
+    let cut = server::gzip_body(len).len() / 2;
+
+    for chunked in [false, true] {
+        let url = server.url(&format!(
+            "/gzip?len={}&chunked={}&cut={}",
+            len, chunked as u8, cut
+        ));
+        match client.get(url.as_str()).unwrap().send().await {
+            Err(error) => println!(
+                "{:?}: cut gzip (chunked: {}) failed before the body: {}",
+                backend, chunked, error
+            ),
+            Ok(response) => match drain(response).await {
+                Ok((total, _)) => panic!(
+                    "gzip body cut at {} wire bytes (chunked: {}) ended cleanly after {} bytes",
+                    cut, chunked, total
+                ),
+                Err((total, error)) => println!(
+                    "{:?}: cut gzip (chunked: {}) failed after {} bytes: {}",
+                    backend, chunked, total, error
+                ),
+            },
+        }
     }
 }
 
@@ -859,6 +1012,8 @@ macro_rules! backend_suite {
                 mid_body_drop_is_an_error,
                 dropping_the_stream_cancels_the_transfer,
                 identity_encoding_is_honoured,
+                compressed_bodies_are_decoded_and_counted,
+                compressed_body_cut_short_is_an_error,
                 redirect_keeps_range,
                 non_ascii_header_values_do_not_panic,
                 errors_are_classified,

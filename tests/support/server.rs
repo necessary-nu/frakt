@@ -24,10 +24,25 @@ use tokio::task::JoinHandle;
 /// `Last-Modified` of every generated body.
 pub const LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
 
-/// Body served by `/encoded`, in identity form.
-pub const ENCODED_TEXT: &str = "frakt identity check: this text compresses well. \
-    frakt identity check: this text compresses well. \
-    frakt identity check: this text compresses well.";
+/// A compressible body of `len` bytes: numbered lines of text.
+pub fn text_body(len: usize) -> Vec<u8> {
+    let mut text = Vec::with_capacity(len + 64);
+    let mut line = 0u64;
+    while text.len() < len {
+        text.extend_from_slice(format!("frakt compressible line {:08}\n", line).as_bytes());
+        line += 1;
+    }
+    text.truncate(len);
+    text
+}
+
+/// `text_body(len)` gzip-compressed, as `/gzip` sends it.
+pub fn gzip_body(len: usize) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&text_body(len)).unwrap();
+    encoder.finish().unwrap()
+}
 
 /// The generated body's ETag for a seed and length.
 pub fn etag(seed: u64, len: u64) -> String {
@@ -395,11 +410,38 @@ async fn write_head<S: AsyncWrite + Unpin>(
     stream.flush().await
 }
 
-async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
+/// Lets a handler end a connection with a reset instead of a clean close.
+trait Abort {
+    fn reset_on_close(&self);
+}
+
+impl Abort for tokio::net::TcpStream {
+    fn reset_on_close(&self) {
+        #[allow(deprecated)]
+        let _ = self.set_linger(Some(Duration::ZERO));
+    }
+}
+
+impl Abort for tokio_rustls::server::TlsStream<tokio::net::TcpStream> {
+    fn reset_on_close(&self) {
+        self.get_ref().0.reset_on_close();
+    }
+}
+
+async fn handle<S: AsyncRead + AsyncWrite + Unpin + Abort>(
     mut stream: S,
     state: Arc<State>,
 ) -> io::Result<()> {
-    let request = read_request(&mut stream).await?;
+    while handle_one(&mut stream, &state).await? {}
+    Ok(())
+}
+
+/// Serve one request; returns whether the connection stays open for another.
+async fn handle_one<S: AsyncRead + AsyncWrite + Unpin + Abort>(
+    stream: &mut S,
+    state: &State,
+) -> io::Result<bool> {
+    let request = read_request(&mut *stream).await?;
     state.requests.lock().unwrap().push(Recorded {
         method: request.method.clone(),
         target: request.target.clone(),
@@ -408,8 +450,14 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     });
 
     match request.path.as_str() {
-        "/bytes" => serve_bytes(&mut stream, &request, &state).await?,
-        "/truncate" => return serve_truncated(&mut stream, &request).await,
+        "/bytes" => serve_bytes(&mut *stream, &request, state).await?,
+        "/truncate" => {
+            return serve_truncated(&mut *stream, &request)
+                .await
+                .map(|()| false);
+        }
+        "/chunked" => return serve_chunked(&mut *stream, &request).await,
+        "/gzip" => return serve_gzip(&mut *stream, &request).await.map(|()| false),
         "/stall-headers" => {
             let track = state.track(&request.q("track", String::from("stall-headers")));
             // Wait for the client to give up, then report the connection gone.
@@ -419,9 +467,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 tokio::time::timeout(Duration::from_millis(ms), stream.read(&mut probe)).await;
             if matches!(gone, Ok(Ok(0)) | Ok(Err(_))) {
                 track.finish(true);
-                return Ok(());
+                return Ok(false);
             }
-            write_head(&mut stream, "200 OK", &[("Content-Length", "2".into())]).await?;
+            write_head(&mut *stream, "200 OK", &[("Content-Length", "2".into())]).await?;
             stream.write_all(b"ok").await?;
             track.finish(false);
         }
@@ -430,7 +478,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             let after: u64 = request.q("after", 1 << 16);
             let ms: u64 = request.q("ms", 5_000);
             write_head(
-                &mut stream,
+                &mut *stream,
                 "200 OK",
                 &[("Content-Length", len.to_string())],
             )
@@ -446,7 +494,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             let interval: u64 = request.q("interval_ms", 100);
             let len = pieces * piece;
             write_head(
-                &mut stream,
+                &mut *stream,
                 "200 OK",
                 &[("Content-Length", len.to_string())],
             )
@@ -472,45 +520,11 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
                 _ => "Found",
             };
             write_head(
-                &mut stream,
+                &mut *stream,
                 &format!("{} {}", status, reason),
                 &[("Location", to), ("Content-Length", "0".into())],
             )
             .await?;
-        }
-        "/encoded" => {
-            let accepts_gzip = request
-                .header_str("accept-encoding")
-                .is_some_and(|v| v.contains("gzip"));
-            if accepts_gzip {
-                use std::io::Write;
-                let mut encoder =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                encoder.write_all(ENCODED_TEXT.as_bytes()).unwrap();
-                let gz = encoder.finish().unwrap();
-                write_head(
-                    &mut stream,
-                    "200 OK",
-                    &[
-                        ("Content-Encoding", "gzip".into()),
-                        ("Content-Length", gz.len().to_string()),
-                        ("Content-Type", "text/plain".into()),
-                    ],
-                )
-                .await?;
-                stream.write_all(&gz).await?;
-            } else {
-                write_head(
-                    &mut stream,
-                    "200 OK",
-                    &[
-                        ("Content-Length", ENCODED_TEXT.len().to_string()),
-                        ("Content-Type", "text/plain".into()),
-                    ],
-                )
-                .await?;
-                stream.write_all(ENCODED_TEXT.as_bytes()).await?;
-            }
         }
         "/nonascii" => {
             // Raw bytes: UTF-8 in one header, a lone Latin-1 byte in another.
@@ -538,7 +552,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             })
             .to_string();
             write_head(
-                &mut stream,
+                &mut *stream,
                 "200 OK",
                 &[
                     ("Content-Type", "application/json".into()),
@@ -552,7 +566,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
             let code: u16 = request.q("code", 404);
             let text = format!("status {}", code);
             write_head(
-                &mut stream,
+                &mut *stream,
                 &format!("{} Status", code),
                 &[("Content-Length", text.len().to_string())],
             )
@@ -561,7 +575,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         }
         _ => {
             write_head(
-                &mut stream,
+                &mut *stream,
                 "404 Not Found",
                 &[("Content-Length", "0".into())],
             )
@@ -570,7 +584,8 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     stream.flush().await?;
-    stream.shutdown().await
+    stream.shutdown().await?;
+    Ok(false)
 }
 
 /// `/bytes?len=&seed=&chunk=&track=&etag=&rate=`: a generated body with ETag,
@@ -670,6 +685,103 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
         track.finish(false);
     }
     Ok(())
+}
+
+/// `/gzip?len=&chunked=&cut=`: `text_body(len)`, gzip-encoded with
+/// Content-Encoding if the request accepts gzip and as is otherwise, with a
+/// Content-Length unless `chunked=1`. With `cut`, only that many bytes of
+/// the encoded body are sent before the connection is dropped.
+async fn serve_gzip<S: AsyncRead + AsyncWrite + Unpin + Abort>(
+    stream: &mut S,
+    request: &Request,
+) -> io::Result<()> {
+    let len: usize = request.q("len", 1 << 20);
+    let chunked = request.q("chunked", 0u8) == 1;
+    let cut: Option<usize> = request.query.get("cut").and_then(|v| v.parse().ok());
+    let gzip = request
+        .header_str("accept-encoding")
+        .is_some_and(|v| v.split(',').any(|c| c.trim().starts_with("gzip")));
+    let body = if gzip { gzip_body(len) } else { text_body(len) };
+
+    let mut head =
+        String::from("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n");
+    if gzip {
+        head.push_str("Content-Encoding: gzip\r\n");
+    }
+    if chunked {
+        head.push_str("Transfer-Encoding: chunked\r\n");
+    } else {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+
+    let end = cut.map_or(body.len(), |cut| cut.min(body.len()));
+    for piece in body[..end].chunks(16 * 1024) {
+        if chunked {
+            stream
+                .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
+                .await?;
+            stream.write_all(piece).await?;
+            stream.write_all(b"\r\n").await?;
+        } else {
+            stream.write_all(piece).await?;
+        }
+    }
+    if cut.is_none_or(|cut| cut >= body.len()) && chunked {
+        stream.write_all(b"0\r\n\r\n").await?;
+    }
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
+/// `/chunked?len=&cut=&keepalive=&rst=`: a chunked body of `len` generated
+/// bytes. With `cut`, only that many bytes are sent and the connection is
+/// dropped before the last chunk, with a reset if `rst=1`. With
+/// `keepalive=1` there is no `Connection: close`, and a complete response
+/// leaves the connection open, as a keep-alive server would.
+async fn serve_chunked<S: AsyncRead + AsyncWrite + Unpin + Abort>(
+    stream: &mut S,
+    request: &Request,
+) -> io::Result<bool> {
+    let len: u64 = request.q("len", 1 << 20);
+    let cut: Option<u64> = request.query.get("cut").and_then(|v| v.parse().ok());
+    let keepalive = request.q("keepalive", 0u8) == 1;
+    let rst = request.q("rst", 0u8) == 1;
+    let chunk: u64 = request.q("chunk", 32 * 1024);
+
+    let mut head = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n");
+    if !keepalive {
+        head.push_str("Connection: close\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+
+    let end = cut.map_or(len, |cut| cut.min(len));
+    let mut pos = 0;
+    while pos < end {
+        let n = (end - pos).min(chunk);
+        stream.write_all(format!("{:x}\r\n", n).as_bytes()).await?;
+        stream.write_all(&body(1, pos, pos + n)).await?;
+        stream.write_all(b"\r\n").await?;
+        pos += n;
+    }
+
+    if cut.is_some_and(|cut| cut < len) {
+        stream.flush().await?;
+        if rst {
+            // A reset discards whatever the peer has not read yet, and on a
+            // receiver with full buffers macOS delivers it late; give the
+            // data time to drain first.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stream.reset_on_close();
+        }
+        return Ok(false);
+    }
+
+    stream.write_all(b"0\r\n\r\n").await?;
+    stream.flush().await?;
+    Ok(keepalive)
 }
 
 /// `/truncate?len=&after=&chunked=`: promise `len` bytes (or use chunked
