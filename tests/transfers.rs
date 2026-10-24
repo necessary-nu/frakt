@@ -26,7 +26,7 @@ mod server;
 #[cfg(vampire)]
 use crate as frakt;
 
-use frakt::{BackendType, Client, ClientBuilder, Error};
+use frakt::{BackendType, BodyIntegrity, Client, ClientBuilder, Error};
 use server::Server;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -136,6 +136,64 @@ async fn drain(response: frakt::Response) -> Result<(u64, blake3::Hash), (u64, E
         }
     }
     Ok((total, hasher.finalize()))
+}
+
+/// `require_checked_body` must refuse a response whose integrity is
+/// unverifiable, before its body is read.
+async fn assert_refuses_unverifiable(client: &Client, url: &str) {
+    match client.get(url).unwrap().require_checked_body().send().await {
+        Err(Error::UnverifiableBody(response)) => {
+            assert_eq!(response.body_integrity(), BodyIntegrity::Unverifiable)
+        }
+        other => panic!(
+            "require_checked_body accepted an unverifiable body: {:?}",
+            other.map(|r| r.status())
+        ),
+    }
+}
+
+async fn require_checked_body_matches_integrity(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+
+    // A Content-Length is checked by every backend.
+    let url = server.url("/bytes?len=100000");
+    let response = client
+        .get(url.as_str())
+        .unwrap()
+        .require_checked_body()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.body_integrity(), BodyIntegrity::Checked);
+    assert_eq!(drain(response).await.unwrap().0, 100_000);
+
+    // Chunked framing is checked by every stack but CFNetwork.
+    for keepalive in [0, 1] {
+        let url = server.url(&format!("/chunked?len=100000&keepalive={}", keepalive));
+        let integrity = client
+            .get(url.as_str())
+            .unwrap()
+            .send()
+            .await
+            .unwrap()
+            .body_integrity();
+        println!("{:?}: chunked body integrity {:?}", backend, integrity);
+        match integrity {
+            BodyIntegrity::Checked => {
+                let response = client
+                    .get(url.as_str())
+                    .unwrap()
+                    .require_checked_body()
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(drain(response).await.unwrap().0, 100_000);
+            }
+            BodyIntegrity::Unverifiable => assert_refuses_unverifiable(&client, &url).await,
+        }
+    }
 }
 
 async fn large_body_is_byte_exact(backend: BackendType) {
@@ -397,27 +455,45 @@ async fn mid_body_drop_is_an_error(backend: BackendType) {
 
         // A stack may notice the drop before it hands over the response;
         // failing send() is as good as failing the body.
-        match client.get(url.as_str()).unwrap().send().await {
-            Err(error) => println!(
-                "{:?}: truncated ({}) failed before the body: {}",
-                backend, case, error
-            ),
-            Ok(response) => match drain(response).await {
-                Ok((total, _)) => panic!(
-                    "truncated body ({}) ended cleanly after {} bytes",
-                    case, total
-                ),
-                Err((total, error)) => {
-                    assert!(
-                        total <= MIB,
-                        "read {} bytes of a 1 MiB truncated body",
-                        total
-                    );
-                    println!("{:?}: truncated ({}): {}", backend, case, error);
+        let unverifiable = match client.get(url.as_str()).unwrap().send().await {
+            Err(error) => {
+                println!(
+                    "{:?}: truncated ({}) failed before the body: {}",
+                    backend, case, error
+                );
+                false
+            }
+            Ok(response) => {
+                let integrity = response.body_integrity();
+                match drain(response).await {
+                    Ok((total, _)) if integrity == BodyIntegrity::Unverifiable => {
+                        println!(
+                            "{:?}: truncated ({}) ended cleanly after {} bytes, as its Unverifiable integrity warned",
+                            backend, case, total
+                        );
+                        true
+                    }
+                    Ok((total, _)) => panic!(
+                        "truncated body ({}, {:?}) ended cleanly after {} bytes",
+                        case, integrity, total
+                    ),
+                    Err((total, error)) => {
+                        assert!(
+                            total <= MIB,
+                            "read {} bytes of a 1 MiB truncated body",
+                            total
+                        );
+                        println!("{:?}: truncated ({}): {}", backend, case, error);
+                        false
+                    }
                 }
-            },
-        }
+            }
+        };
 
+        if unverifiable {
+            assert_refuses_unverifiable(&client, &url).await;
+            continue;
+        }
         if let Ok(response) = client.get(url.as_str()).unwrap().send().await {
             let mut reader = response.stream();
             let result = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
@@ -655,16 +731,26 @@ async fn compressed_body_cut_short_is_an_error(backend: BackendType) {
                 "{:?}: cut gzip (chunked: {}) failed before the body: {}",
                 backend, chunked, error
             ),
-            Ok(response) => match drain(response).await {
-                Ok((total, _)) => panic!(
-                    "gzip body cut at {} wire bytes (chunked: {}) ended cleanly after {} bytes",
-                    cut, chunked, total
-                ),
-                Err((total, error)) => println!(
-                    "{:?}: cut gzip (chunked: {}) failed after {} bytes: {}",
-                    backend, chunked, total, error
-                ),
-            },
+            Ok(response) => {
+                let integrity = response.body_integrity();
+                match drain(response).await {
+                    Ok((total, _)) if integrity == BodyIntegrity::Unverifiable => {
+                        println!(
+                            "{:?}: cut gzip (chunked: {}) ended cleanly after {} bytes, as its Unverifiable integrity warned",
+                            backend, chunked, total
+                        );
+                        assert_refuses_unverifiable(&client, &url).await;
+                    }
+                    Ok((total, _)) => panic!(
+                        "gzip body cut at {} wire bytes (chunked: {}, {:?}) ended cleanly after {} bytes",
+                        cut, chunked, integrity, total
+                    ),
+                    Err((total, error)) => println!(
+                        "{:?}: cut gzip (chunked: {}) failed after {} bytes: {}",
+                        backend, chunked, total, error
+                    ),
+                }
+            }
         }
     }
 }
@@ -1014,6 +1100,7 @@ macro_rules! backend_suite {
                 identity_encoding_is_honoured,
                 compressed_bodies_are_decoded_and_counted,
                 compressed_body_cut_short_is_an_error,
+                require_checked_body_matches_integrity,
                 redirect_keeps_range,
                 non_ascii_header_values_do_not_panic,
                 errors_are_classified,
