@@ -277,105 +277,17 @@ impl FoundationBackend {
         session_identifier: Option<String>,
         headers: http::HeaderMap,
         progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
-        _error_for_status: bool,
+        error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
-        use delegate::background_session::BackgroundSessionDelegate;
-        use delegate::shared_context::TaskSharedContext;
-        use objc2_foundation::NSURLSessionConfiguration;
-        use std::sync::Arc;
-
-        // Generate session identifier if not provided
-        let session_id = session_identifier.unwrap_or_else(|| {
-            format!(
-                "frakt-bg-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            )
-        });
-
-        // Create background session configuration
-        let session_config = {
-            NSURLSessionConfiguration::backgroundSessionConfigurationWithIdentifier(
-                &NSString::from_str(&session_id),
-            )
-        };
-
-        // Create background delegate
-        let delegate = BackgroundSessionDelegate::new();
-        let session = unsafe {
-            NSURLSession::sessionWithConfiguration_delegate_delegateQueue(
-                &session_config,
-                Some(ProtocolObject::from_ref(&*delegate)),
-                None,
-            )
-        };
-
-        // Create download task with headers
-        let nsurl =
-            { NSURL::URLWithString(&NSString::from_str(url.as_str())).ok_or(Error::InvalidUrl)? };
-
-        let nsrequest = {
-            let req = NSMutableURLRequest::requestWithURL(&nsurl);
-
-            for (name, value) in &headers {
-                req.addValue_forHTTPHeaderField(
-                    &header_value_string(value),
-                    &NSString::from_str(name.as_str()),
-                );
-            }
-
-            req
-        };
-
-        let download_task = session.downloadTaskWithRequest(&nsrequest);
-        let task_id = download_task.taskIdentifier() as usize;
-
-        // Create task context
-        let mut task_context = if let Some(callback) = progress_callback {
-            TaskSharedContext::with_progress_callback(Arc::new(callback))
-        } else {
-            TaskSharedContext::new()
-        };
-
-        task_context.download_context = Some(Arc::new(
-            delegate::shared_context::DownloadContext::new(Some(file_path.clone())),
-        ));
-
-        let task_context = Arc::new(task_context);
-
-        // Register task with delegate
-        delegate.register_task(task_id, task_context.clone());
-
-        // Start download
-        download_task.resume();
-
-        // Wait for completion
-        while !task_context.is_completed() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        // Check for errors
-        if let Some(error) = task_context.error.load_full() {
-            return Err(Error::from_ns_error(&*error));
-        }
-
-        // Calculate bytes downloaded
-        let bytes_downloaded = task_context
-            .bytes_downloaded
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        // TODO: Capture actual status and headers from NSURLSessionDownloadTask response
-        // For now, we use placeholder values since background downloads don't easily
-        // expose the HTTP response
-        Ok(crate::client::download::DownloadResponse {
+        background::execute_background_download(
+            url,
             file_path,
-            bytes_downloaded,
-            status: http::StatusCode::OK,
-            headers: http::HeaderMap::new(),
-        })
+            session_identifier,
+            headers,
+            progress_callback,
+            error_for_status,
+        )
+        .await
     }
 
     /// Get the cookie jar if configured
