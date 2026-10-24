@@ -157,6 +157,10 @@ impl WindowsBackend {
         })
     }
 
+    pub(crate) fn default_headers(&self) -> Option<&http::HeaderMap> {
+        self.default_headers.as_ref()
+    }
+
     pub(crate) fn total_timeout(&self) -> Option<Duration> {
         self.total_timeout
     }

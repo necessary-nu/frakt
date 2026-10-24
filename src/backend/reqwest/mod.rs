@@ -5,7 +5,7 @@ mod background;
 pub mod websocket;
 pub use websocket::{ReqwestWebSocket, ReqwestWebSocketBuilder};
 
-use crate::backend::types::{BackendRequest, BackendResponse, ProgressCallback};
+use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting, ProgressCallback};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::Stream;
@@ -76,6 +76,7 @@ impl Stream for ProgressTrackingStream {
 /// connection.
 struct ReqwestBody {
     inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    accounting: Arc<BodyAccounting>,
     read_timeout: Option<Duration>,
     /// Armed only while the consumer is waiting on the network.
     idle: Option<Pin<Box<Sleep>>>,
@@ -92,6 +93,7 @@ impl Stream for ReqwestBody {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.idle = None;
+                self.accounting.add_wire_bytes(chunk.len() as u64);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -195,6 +197,7 @@ fn error_chain_message(error: &(dyn std::error::Error + 'static)) -> String {
 pub struct ReqwestBackend {
     client: reqwest::Client,
     cookie_jar: Option<crate::CookieJar>,
+    default_headers: Option<http::HeaderMap>,
     read_timeout: Option<Duration>,
     total_timeout: Option<Duration>,
 }
@@ -228,7 +231,7 @@ impl ReqwestBackend {
         }
 
         // Apply default headers
-        if let Some(default_headers) = config.default_headers {
+        if let Some(default_headers) = config.default_headers.clone() {
             // Convert http::HeaderMap to reqwest::header::HeaderMap
             let mut reqwest_headers = reqwest::header::HeaderMap::new();
             for (name, value) in default_headers {
@@ -297,9 +300,14 @@ impl ReqwestBackend {
         Ok(Self {
             client,
             cookie_jar: config.cookie_jar,
+            default_headers: config.default_headers,
             read_timeout: config.read_timeout,
             total_timeout: config.timeout,
         })
+    }
+
+    pub(crate) fn default_headers(&self) -> Option<&http::HeaderMap> {
+        self.default_headers.as_ref()
     }
 
     pub(crate) fn total_timeout(&self) -> Option<Duration> {
@@ -382,16 +390,20 @@ impl ReqwestBackend {
         }
         .map_err(map_reqwest_error)?;
 
+        let headers = response.headers().clone();
+        let accounting = BodyAccounting::undecoded(&headers);
         Ok(BackendResponse {
             status: response.status(),
-            headers: response.headers().clone(),
             url: response.url().clone(),
             body: Box::pin(ReqwestBody {
                 inner: Box::pin(response.bytes_stream()),
+                accounting: accounting.clone(),
                 read_timeout,
                 idle: None,
                 done: false,
             }),
+            headers,
+            accounting,
             redirect_headers: vec![],
         })
     }

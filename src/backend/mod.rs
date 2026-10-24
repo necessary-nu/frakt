@@ -54,13 +54,16 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 ///   last byte of the body. It is off by default because it would cut off
 ///   large downloads.
 ///
-/// The default headers contain `Accept-Encoding: identity`, so bodies arrive
-/// exactly as the server stored them and `Content-Length`/`Content-Range`
-/// describe the bytes delivered. Foundation and Cronet otherwise ask for
-/// compressed bodies and decode them transparently, which breaks byte-range
-/// resumption. A caller that sets another `Accept-Encoding` gets
-/// backend-specific behaviour: Foundation and Cronet decode the body, reqwest
-/// and WinHTTP deliver it encoded.
+/// Every backend asks for compressed bodies and decodes them, as its
+/// platform stack does by default; [`Response::is_decoded`] says when it
+/// did and [`Response::body_stats`] how many bytes crossed the wire. A
+/// request with a `Range` header is sent with `Accept-Encoding: identity`
+/// unless the caller (on the request or as a client default header) set
+/// `Accept-Encoding` itself, because a byte range of a decoded body means
+/// nothing. An explicit `Accept-Encoding: identity` is honoured everywhere.
+///
+/// [`Response::is_decoded`]: crate::Response::is_decoded
+/// [`Response::body_stats`]: crate::Response::body_stats
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     /// Total deadline per request; `None` (the default) for no deadline
@@ -89,18 +92,13 @@ pub struct BackendConfig {
 
 impl Default for BackendConfig {
     fn default() -> Self {
-        let mut default_headers = http::HeaderMap::new();
-        default_headers.insert(
-            http::header::ACCEPT_ENCODING,
-            http::HeaderValue::from_static("identity"),
-        );
         Self {
             timeout: None,
             connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
             user_agent: None,
             ignore_certificate_errors: None,
-            default_headers: Some(default_headers),
+            default_headers: None,
             use_cookies: None,
             cookie_jar: None,
             http_proxy: None,
@@ -304,6 +302,26 @@ impl Backend {
             #[allow(unreachable_patterns)]
             _ => unreachable!("No backend available"),
         }
+    }
+
+    /// Whether the client's default headers include `name`.
+    pub(crate) fn has_default_header(&self, name: &http::HeaderName) -> bool {
+        let defaults = match self {
+            #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
+            Backend::Foundation(f) => f.default_headers(),
+
+            #[cfg(all(feature = "backend-winhttp", windows))]
+            Backend::Windows(w) => w.default_headers(),
+
+            #[cfg(all(feature = "backend-android", target_os = "android"))]
+            Backend::Android(a) => a.default_headers(),
+
+            #[cfg(feature = "backend-reqwest")]
+            Backend::Reqwest(r) => r.default_headers(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        };
+        defaults.is_some_and(|headers| headers.contains_key(name))
     }
 
     /// The client-wide total deadline per request, if configured

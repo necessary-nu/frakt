@@ -104,8 +104,14 @@ pub async fn execute_request(
     })
     .await?;
 
+    // Cronet decodes gzip, deflate and br bodies itself.
+    let accounting = crate::backend::types::BodyAccounting::new(
+        crate::backend::types::has_content_coding(&head.headers),
+        crate::backend::types::content_length(&head.headers),
+    );
     Ok(BackendResponse {
         status: head.status,
+        accounting,
         headers: head.headers,
         url: head.url.unwrap_or(original_url),
         body: Box::pin(CronetBody {

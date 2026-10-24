@@ -154,6 +154,10 @@ impl FoundationBackend {
         })
     }
 
+    pub(crate) fn default_headers(&self) -> Option<&http::HeaderMap> {
+        self.default_headers.as_ref()
+    }
+
     pub(crate) fn total_timeout(&self) -> Option<Duration> {
         self.total_timeout
     }
@@ -173,11 +177,17 @@ impl FoundationBackend {
         let mut body = objc2::rc::autoreleasepool(|_| self.start(request))?;
         let head = std::future::poll_fn(|cx| body.poll_head(cx)).await?;
 
+        // CFNetwork decodes gzip, deflate and br bodies itself.
+        let accounting = crate::backend::types::BodyAccounting::new(
+            crate::backend::types::has_content_coding(&head.headers),
+            crate::backend::types::content_length(&head.headers),
+        );
         Ok(BackendResponse {
             status: head.status,
             headers: head.headers,
             url: head.url.unwrap_or(requested_url),
             body: Box::pin(body),
+            accounting,
             redirect_headers: vec![],
         })
     }

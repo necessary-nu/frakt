@@ -396,6 +396,7 @@ pub(crate) async fn execute(
 
     Ok(BackendResponse {
         status,
+        accounting: crate::backend::types::BodyAccounting::undecoded(&response_headers),
         headers: response_headers,
         url: final_url,
         body: channel_body(rx),

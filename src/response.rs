@@ -5,10 +5,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::backend::types::{BackendResponse, BodyStream};
+use crate::backend::types::{BackendResponse, BodyAccounting, BodyStream};
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use std::sync::Arc;
 use tokio::time::{Instant, Sleep};
 use url::Url;
 
@@ -42,17 +43,45 @@ impl Response {
         deadline: Option<Instant>,
         head_request: bool,
     ) -> Self {
-        let expected_len = if head_request {
-            None
-        } else {
-            expected_body_len(backend_response.status, &backend_response.headers)
-        };
+        let status = backend_response.status;
+        let has_body = !(head_request
+            || status.is_informational()
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED);
         Self {
-            status: backend_response.status,
+            status,
             headers: backend_response.headers,
             url: backend_response.url,
-            body: ResponseBody::new(backend_response.body, deadline, expected_len),
+            body: ResponseBody::new(
+                backend_response.body,
+                deadline,
+                backend_response.accounting,
+                has_body,
+            ),
         }
+    }
+
+    /// Whether the backend decoded a content coding (gzip, br, ...), so the
+    /// body delivered differs from the bytes the server sent.
+    ///
+    /// Backends ask for compressed bodies and decode them by default. A
+    /// request with a `Range` header and no explicit `Accept-Encoding` is
+    /// sent with `Accept-Encoding: identity`, because a byte range of a
+    /// decoded body means nothing.
+    pub fn is_decoded(&self) -> bool {
+        self.body.accounting.decoded()
+    }
+
+    /// The body length the server announced (its Content-Length, which
+    /// counts the encoded bytes), if it announced one and the backend could
+    /// see it.
+    pub fn expected_wire_length(&self) -> Option<u64> {
+        self.body.expected_wire_length()
+    }
+
+    /// Bytes counted so far; see [`BodyStats`].
+    pub fn body_stats(&self) -> BodyStats {
+        self.body.stats()
     }
 
     /// Get the status code
@@ -125,41 +154,33 @@ impl Response {
     }
 }
 
-/// The body length a response promises, when the bytes delivered must match
-/// it: an identity body with a Content-Length.
-fn expected_body_len(status: StatusCode, headers: &HeaderMap) -> Option<u64> {
-    if status.is_informational()
-        || status == StatusCode::NO_CONTENT
-        || status == StatusCode::NOT_MODIFIED
-    {
-        return None;
-    }
-    let encoded = headers
-        .get_all(http::header::CONTENT_ENCODING)
-        .iter()
-        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"));
-    if encoded {
-        return None;
-    }
-    headers
-        .get(http::header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// How much of a body has arrived, and how it relates to what the server
+/// sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyStats {
+    /// The backend decoded a content coding.
+    pub decoded: bool,
+    /// The body length the server announced, if known.
+    pub expected_wire_length: Option<u64>,
+    /// Body bytes received over the network, before content decoding, if
+    /// the backend's stack reports them.
+    pub wire_bytes: Option<u64>,
+    /// Body bytes delivered to the caller so far.
+    pub delivered_bytes: u64,
 }
 
 /// A backend body plus the request's total deadline.
 ///
-/// It also checks the body against Content-Length, so that a connection
-/// that closes early is an error even on a stack that reports it as a clean
-/// end.
+/// When the body ends it is checked against the announced length, using
+/// the wire count when the backend reports one and the delivered count when
+/// the body was not decoded, so that a connection that closes early is an
+/// error even on a stack that reports it as a clean end.
 struct ResponseBody {
     stream: Option<BodyStream>,
     deadline: Option<Pin<Box<Sleep>>>,
-    expected_len: Option<u64>,
-    received: u64,
+    accounting: Arc<BodyAccounting>,
+    has_body: bool,
+    delivered: u64,
 }
 
 // SAFETY: every method takes `&mut self`, so a shared reference gives no
@@ -168,13 +189,53 @@ struct ResponseBody {
 unsafe impl Sync for ResponseBody {}
 
 impl ResponseBody {
-    fn new(stream: BodyStream, deadline: Option<Instant>, expected_len: Option<u64>) -> Self {
+    fn new(
+        stream: BodyStream,
+        deadline: Option<Instant>,
+        accounting: Arc<BodyAccounting>,
+        has_body: bool,
+    ) -> Self {
         Self {
             stream: Some(stream),
             deadline: deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
-            expected_len,
-            received: 0,
+            accounting,
+            has_body,
+            delivered: 0,
         }
+    }
+
+    fn expected_wire_length(&self) -> Option<u64> {
+        self.accounting
+            .expected_wire_length()
+            .filter(|_| self.has_body)
+    }
+
+    fn stats(&self) -> BodyStats {
+        BodyStats {
+            decoded: self.accounting.decoded(),
+            expected_wire_length: self.expected_wire_length(),
+            wire_bytes: self.accounting.wire_bytes(),
+            delivered_bytes: self.delivered,
+        }
+    }
+
+    /// The error for a body that ended before its announced length.
+    fn short_body(&self) -> Option<Error> {
+        let expected = self.expected_wire_length()?;
+        let (received, counter) = match self.accounting.wire_bytes() {
+            Some(wire) => (wire, "received"),
+            None if !self.accounting.decoded() => (self.delivered, "received"),
+            // Decoded, and the stack does not say how much arrived: only the
+            // stack itself can tell.
+            None => return None,
+        };
+        (received < expected).then(|| Error::Network {
+            code: -1,
+            message: format!(
+                "Connection closed after {} of {} body bytes {}",
+                received, expected, counter
+            ),
+        })
     }
 
     async fn next(&mut self) -> Option<Result<Bytes>> {
@@ -196,7 +257,7 @@ impl ResponseBody {
 
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                self.received += chunk.len() as u64;
+                self.delivered += chunk.len() as u64;
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -205,17 +266,9 @@ impl ResponseBody {
             }
             Poll::Ready(None) => {
                 self.stream = None;
-                match self.expected_len {
-                    Some(expected) if self.received < expected => {
-                        Poll::Ready(Some(Err(Error::Network {
-                            code: -1,
-                            message: format!(
-                                "Connection closed after {} of {} body bytes",
-                                self.received, expected
-                            ),
-                        })))
-                    }
-                    _ => Poll::Ready(None),
+                match self.short_body() {
+                    Some(error) => Poll::Ready(Some(Err(error))),
+                    None => Poll::Ready(None),
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -234,6 +287,12 @@ pub struct ResponseStream {
 }
 
 impl ResponseStream {
+    /// Bytes counted so far; final once the stream has ended. See
+    /// [`BodyStats`].
+    pub fn stats(&self) -> BodyStats {
+        self.body.stats()
+    }
+
     /// Get the next chunk of bytes
     pub async fn next(&mut self) -> Option<Result<Bytes>> {
         if let Some(rest) = self.take_partial_chunk() {
@@ -314,12 +373,15 @@ mod tests {
             );
         }
         let chunks: Vec<Result<Bytes>> = chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect();
+        let decoded = crate::backend::types::has_content_coding(&map);
+        let accounting = BodyAccounting::new(decoded, crate::backend::types::content_length(&map));
         Response::from_backend(
             BackendResponse {
                 status: StatusCode::from_u16(status).unwrap(),
                 headers: map,
                 url: Url::parse("http://example.invalid/").unwrap(),
                 body: Box::pin(futures_util::stream::iter(chunks)),
+                accounting,
                 redirect_headers: vec![],
             },
             None,

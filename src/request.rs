@@ -30,10 +30,21 @@ impl Request {
             .timeout
             .or(self.backend.total_timeout())
             .map(|timeout| tokio::time::Instant::now() + timeout);
+        let mut headers = self.headers;
+        if headers.contains_key(header::RANGE)
+            && !headers.contains_key(header::ACCEPT_ENCODING)
+            && !self.backend.has_default_header(&header::ACCEPT_ENCODING)
+        {
+            // The range must address the stored bytes, not a decoded body.
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+        }
         let backend_request = BackendRequest {
             method: self.method,
             url: self.url,
-            headers: self.headers,
+            headers,
             body: self.body,
             progress_callback: self.progress_callback,
             read_timeout: self.read_timeout,

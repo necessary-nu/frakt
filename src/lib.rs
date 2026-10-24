@@ -218,9 +218,10 @@
 //! - Connection pooling and keep-alive
 //! - Background downloads via daemon processes (Unix) or resumable downloads
 //!
-//! Every backend asks for `Accept-Encoding: identity` unless told otherwise,
-//! so bodies arrive as stored and `Content-Length` and `Content-Range`
-//! describe the bytes delivered; see
+//! Every backend asks for compressed bodies and decodes them, except for
+//! `Range` requests, which are sent with `Accept-Encoding: identity` unless
+//! the caller chose an encoding. [`Response::is_decoded`] and
+//! [`Response::body_stats`] say what happened to the body; see
 //! [`BackendConfig`](crate::backend::BackendConfig) for this and for what
 //! the timeouts mean.
 
@@ -236,7 +237,7 @@ pub use client::{
 };
 pub use error::{Error, Result};
 pub use request::{Request, RequestBuilder};
-pub use response::{Response, ResponseStream};
+pub use response::{BodyStats, Response, ResponseStream};
 
 // Re-export body types
 pub use body::Body;

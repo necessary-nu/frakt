@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -49,8 +50,95 @@ pub struct BackendResponse {
     pub url: Url,
     /// The response body
     pub body: BodyStream,
+    /// How the body relates to the bytes on the wire
+    pub accounting: Arc<BodyAccounting>,
     /// Headers from redirect responses (for cookie processing)
     pub redirect_headers: Vec<HeaderMap>,
+}
+
+/// What a backend knows about a body's encoding and size.
+///
+/// The backend creates it with the response head and, if its stack reports
+/// how many body bytes arrived over the network, updates the wire count as
+/// the body is read; the count must be final before the body stream ends.
+/// "Wire bytes" are the body as sent, after any transfer coding (chunked
+/// framing) is removed and before any content coding (gzip, br, ...) is
+/// decoded: the bytes Content-Length counts.
+#[derive(Debug)]
+pub struct BodyAccounting {
+    decoded: bool,
+    expected_wire_length: Option<u64>,
+    wire_bytes: AtomicU64,
+    wire_counted: AtomicBool,
+}
+
+impl BodyAccounting {
+    /// `decoded`: the stack decoded a content coding, so the delivered body
+    /// differs from the wire bytes. `expected_wire_length`: the
+    /// Content-Length the server sent, which some stacks strip when they
+    /// decode.
+    pub fn new(decoded: bool, expected_wire_length: Option<u64>) -> Arc<Self> {
+        Arc::new(Self {
+            decoded,
+            expected_wire_length,
+            wire_bytes: AtomicU64::new(0),
+            wire_counted: AtomicBool::new(false),
+        })
+    }
+
+    /// For a body delivered exactly as sent: its Content-Length, if any, is
+    /// the expected length.
+    pub fn undecoded(headers: &HeaderMap) -> Arc<Self> {
+        Self::new(false, content_length(headers))
+    }
+
+    /// Record that `n` more body bytes arrived over the network.
+    pub fn add_wire_bytes(&self, n: u64) {
+        self.wire_bytes.fetch_add(n, Ordering::Relaxed);
+        self.wire_counted.store(true, Ordering::Release);
+    }
+
+    /// Record the total body bytes that arrived over the network so far.
+    pub fn set_wire_bytes(&self, total: u64) {
+        self.wire_bytes.store(total, Ordering::Relaxed);
+        self.wire_counted.store(true, Ordering::Release);
+    }
+
+    /// Whether the stack decoded a content coding.
+    pub fn decoded(&self) -> bool {
+        self.decoded
+    }
+
+    /// The body length the server announced, when it did.
+    pub fn expected_wire_length(&self) -> Option<u64> {
+        self.expected_wire_length
+    }
+
+    /// Body bytes received over the network, if the stack reports them.
+    pub fn wire_bytes(&self) -> Option<u64> {
+        self.wire_counted
+            .load(Ordering::Acquire)
+            .then(|| self.wire_bytes.load(Ordering::Relaxed))
+    }
+}
+
+/// The Content-Length header's value, if it has a valid one.
+pub fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether the headers name a content coding other than identity.
+pub fn has_content_coding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
 }
 
 /// Wrap the receiving end of a body channel as a [`BodyStream`].
