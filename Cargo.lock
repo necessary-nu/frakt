@@ -487,7 +487,6 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-security",
- "once_cell",
  "pathos",
  "rand",
  "rcgen",

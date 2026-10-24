@@ -114,7 +114,6 @@ rand = { version = "0.9.2", optional = true }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }
 cookie_store = { version = "0.22", optional = true }
-once_cell = { version = "1.19", optional = true }
 
 # Only the on-device test harness links vampire: it exports JNI_OnLoad and
 # test-runner JNI symbols that would collide with a host app's own.
@@ -143,7 +142,7 @@ default = ["backend-reqwest"]
 backend-reqwest = ["dep:reqwest", "tokio-tungstenite", "dep:rustls", "dep:async-compression", "dep:tokio-util"]
 backend-winhttp = ["windows", "windows-core", "windows-sys", "cookie_store", "rand"]
 backend-foundation = ["objc2", "objc2-foundation", "objc2-security", "block2"]
-backend-android = ["jni", "cookie_store", "once_cell"]
+backend-android = ["jni", "cookie_store"]
 
 [package.metadata.vampire]
 permissions = [
@@ -156,11 +155,6 @@ permissions = [
 [package.metadata.vampire.dependencies]
 "org.chromium.net:cronet-api" = "141.7340.3"
 "org.chromium.net:cronet-embedded" = "141.7340.3"
-"androidx.work:work-runtime" = "2.10.5"
-"androidx.core:core" = "1.15.0"
-
-[package.metadata.vampire.res.xml."values.xml"]
-enable_system_job_service_default = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(vampire)"] }
