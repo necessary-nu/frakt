@@ -44,8 +44,13 @@ impl BackgroundDownloadBuilder {
     /// Set session identifier for background downloads.
     ///
     /// The session identifier is used to track and manage background downloads
-    /// across app restarts. If not provided, a unique identifier will be
-    /// automatically generated based on process ID and timestamp.
+    /// across app restarts. On Apple platforms it names the background
+    /// NSURLSession, which is shared by every download with the same
+    /// identifier; without one, `frakt.background` is used. For results that
+    /// must survive the app being terminated, use
+    /// `frakt::background::BackgroundDownloads`, which reports them to a
+    /// handler in a later launch; this builder's future only completes in
+    /// the process that started the download.
     ///
     /// # Arguments
     ///
