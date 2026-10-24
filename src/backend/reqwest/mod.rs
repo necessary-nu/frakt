@@ -75,8 +75,7 @@ impl Stream for ProgressTrackingStream {
 /// socket only as fast as the consumer reads and dropping it closes the
 /// connection.
 struct ReqwestBody {
-    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
-    accounting: Arc<BodyAccounting>,
+    inner: BodyItems,
     read_timeout: Option<Duration>,
     /// Armed only while the consumer is waiting on the network.
     idle: Option<Pin<Box<Sleep>>>,
@@ -93,12 +92,11 @@ impl Stream for ReqwestBody {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.idle = None;
-                self.accounting.add_wire_bytes(chunk.len() as u64);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(error))) => {
                 self.done = true;
-                Poll::Ready(Some(Err(map_reqwest_error(error))))
+                Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
                 self.done = true;
@@ -118,6 +116,85 @@ impl Stream for ReqwestBody {
                 Poll::Pending
             }
         }
+    }
+}
+
+type BodyItems = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+
+/// The codings the reqwest backend asks for and decodes.
+const ACCEPT_ENCODING: &str = "gzip, deflate, br";
+
+#[derive(Clone, Copy)]
+enum Coding {
+    Gzip,
+    Deflate,
+    Brotli,
+}
+
+/// The coding to undo, if the body has exactly one that we decode.
+fn decodable_coding(headers: &http::HeaderMap) -> Option<Coding> {
+    let mut codings = headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| value.to_str().unwrap_or("?").split(','))
+        .map(|coding| coding.trim().to_ascii_lowercase())
+        .filter(|coding| !coding.is_empty() && coding != "identity");
+    let coding = match codings.next()?.as_str() {
+        "gzip" | "x-gzip" => Coding::Gzip,
+        "deflate" => Coding::Deflate,
+        "br" => Coding::Brotli,
+        _ => return None,
+    };
+    codings.next().is_none().then_some(coding)
+}
+
+/// The response body as delivered: decoded if `coding` is set, with every
+/// raw chunk counted as wire bytes on the way in. hyper has already checked
+/// the raw body against Content-Length or chunked framing.
+fn body_items(
+    raw: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    coding: Option<Coding>,
+    accounting: Arc<BodyAccounting>,
+) -> BodyItems {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
+    use futures_util::StreamExt;
+
+    let raw =
+        raw.map(move |chunk| chunk.inspect(|bytes| accounting.add_wire_bytes(bytes.len() as u64)));
+    let Some(coding) = coding else {
+        return Box::pin(raw.map(|chunk| chunk.map_err(map_reqwest_error)));
+    };
+
+    let reader =
+        tokio_util::io::StreamReader::new(raw.map(|chunk| chunk.map_err(std::io::Error::other)));
+    let decoder: Pin<Box<dyn tokio::io::AsyncRead + Send>> = match coding {
+        Coding::Gzip => {
+            let mut decoder = GzipDecoder::new(reader);
+            decoder.multiple_members(true);
+            Box::pin(decoder)
+        }
+        Coding::Deflate => Box::pin(ZlibDecoder::new(reader)),
+        Coding::Brotli => Box::pin(BrotliDecoder::new(reader)),
+    };
+    Box::pin(
+        tokio_util::io::ReaderStream::with_capacity(decoder, 64 * 1024)
+            .map(|chunk| chunk.map_err(map_decode_error)),
+    )
+}
+
+/// A transport error from under the decoder keeps its classification;
+/// anything else is a body that would not decode.
+fn map_decode_error(error: std::io::Error) -> Error {
+    let message = error.to_string();
+    match error
+        .into_inner()
+        .map(|inner| inner.downcast::<reqwest::Error>())
+    {
+        Some(Ok(error)) => map_reqwest_error(*error),
+        _ => Error::Network {
+            code: -1,
+            message: format!("Failed to decode the response body: {}", message),
+        },
     }
 }
 
@@ -327,6 +404,11 @@ impl ReqwestBackend {
         // Build request
         let read_timeout = request.read_timeout.or(self.read_timeout);
         let mut req_builder = self.client.request(request.method, request.url);
+        let chosen =
+            |headers: &http::HeaderMap| headers.contains_key(http::header::ACCEPT_ENCODING);
+        if !chosen(&request.headers) && !self.default_headers.as_ref().is_some_and(chosen) {
+            req_builder = req_builder.header(http::header::ACCEPT_ENCODING, ACCEPT_ENCODING);
+        }
 
         // Add headers
         for (name, value) in &request.headers {
@@ -391,13 +473,16 @@ impl ReqwestBackend {
         .map_err(map_reqwest_error)?;
 
         let headers = response.headers().clone();
-        let accounting = BodyAccounting::undecoded(&headers);
+        let coding = decodable_coding(&headers);
+        let accounting = BodyAccounting::new(
+            coding.is_some(),
+            crate::backend::types::content_length(&headers),
+        );
         Ok(BackendResponse {
             status: response.status(),
             url: response.url().clone(),
             body: Box::pin(ReqwestBody {
-                inner: Box::pin(response.bytes_stream()),
-                accounting: accounting.clone(),
+                inner: body_items(response.bytes_stream(), coding, accounting.clone()),
                 read_timeout,
                 idle: None,
                 done: false,

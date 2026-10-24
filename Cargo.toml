@@ -36,6 +36,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 # Only to recognise TLS failures in reqwest's error chain; same version as reqwest's.
 rustls = { version = "0.23", default-features = false, optional = true }
+# The reqwest backend decodes bodies itself: reqwest's own decoding drops
+# Content-Length and Content-Encoding, and with them the wire length.
+async-compression = { version = "0.4", default-features = false, features = ["tokio", "gzip", "zlib", "brotli"], optional = true }
+tokio-util = { version = "0.7", default-features = false, features = ["io"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 tracing = "0.1.41"
@@ -136,7 +140,7 @@ memory-stats = "1"
 
 [features]
 default = ["backend-reqwest"]
-backend-reqwest = ["dep:reqwest", "tokio-tungstenite", "dep:rustls"]
+backend-reqwest = ["dep:reqwest", "tokio-tungstenite", "dep:rustls", "dep:async-compression", "dep:tokio-util"]
 backend-winhttp = ["windows", "windows-core", "windows-sys", "cookie_store", "rand"]
 backend-foundation = ["objc2", "objc2-foundation", "objc2-security", "block2"]
 backend-android = ["jni", "cookie_store", "once_cell"]
