@@ -545,7 +545,7 @@ static UPLOAD_PROVIDER_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 
 /// The class loader for our embedded DEX. Its parent is the application's
 /// class loader, so the DEX classes see Cronet whichever thread loads them.
-pub fn get_dex_classloader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+fn get_dex_classloader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
     if let Some(loader) = DEX_CLASS_LOADER.get() {
         return Ok(loader);
     }
@@ -574,8 +574,8 @@ pub fn get_dex_classloader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
 }
 
 /// Load a class from our embedded DEX by its binary name, e.g.
-/// `se.brendan.frakt.DownloadWorker`.
-pub fn load_class_from_dex<'a>(env: &mut JNIEnv<'a>, class_name: &str) -> Result<JClass<'a>> {
+/// `se.brendan.frakt.RustUrlRequestCallback`.
+fn load_class_from_dex<'a>(env: &mut JNIEnv<'a>, class_name: &str) -> Result<JClass<'a>> {
     let loader = get_dex_classloader(env)?;
     super::load_class_with(env, loader, class_name)
 }

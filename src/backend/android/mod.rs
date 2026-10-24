@@ -3,7 +3,6 @@
 pub(crate) mod background;
 mod callback;
 mod cronet;
-mod download;
 mod jni_bindings;
 mod request;
 
@@ -15,7 +14,6 @@ use jni::{
     JNIEnv, JavaVM,
     objects::{GlobalRef, JClass, JObject, JValue},
 };
-use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex, OnceLock};
 use url::Url;
 
@@ -24,14 +22,6 @@ static APP_CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
 static APP_CLASS_LOADER: OnceLock<GlobalRef> = OnceLock::new();
 static CALLBACK_EXECUTOR: OnceLock<GlobalRef> = OnceLock::new();
 static CRONET_ENGINE: Mutex<Option<Arc<GlobalRef>>> = Mutex::new(None);
-
-// Global Tokio runtime instance - created once for all async operations
-static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create global tokio runtime")
-});
 
 /// Give the Android backend the JavaVM and an Android `Context`.
 ///
@@ -233,11 +223,6 @@ fn get_global_cronet_engine() -> Result<Arc<GlobalRef>> {
     let created = Arc::new(local_frame(&mut env, 32, cronet::create_cronet_engine)?);
     *engine = Some(created.clone());
     Ok(created)
-}
-
-/// Get the global tokio runtime instance
-pub(crate) fn get_runtime() -> &'static tokio::runtime::Runtime {
-    &TOKIO_RUNTIME
 }
 
 /// Start NetLog for debugging network issues
@@ -674,7 +659,8 @@ impl AndroidBackend {
         Ok(response)
     }
 
-    /// Execute a background download using DownloadManager
+    /// Download `url` to `file_path` through WorkManager and wait for it;
+    /// see [`crate::background`] for downloads that outlive the process.
     pub async fn execute_background_download(
         &self,
         url: Url,
@@ -684,14 +670,13 @@ impl AndroidBackend {
         progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
         error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
-        download::execute_background_download(
-            self.jvm,
+        background::download_to_file(
+            session_identifier,
             url,
             file_path,
-            session_identifier,
             headers,
-            error_for_status,
             progress_callback,
+            error_for_status,
         )
         .await
     }

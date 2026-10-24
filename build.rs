@@ -28,33 +28,8 @@ fn main() {
         // Java NIO stubs
         java_dir.join("stubs/java/nio/Buffer.java"),
         java_dir.join("stubs/java/nio/ByteBuffer.java"),
-        // Android stubs
-        java_dir.join("stubs/android/content/Context.java"),
-        java_dir.join("stubs/android/os/Build.java"),
-        java_dir.join("stubs/android/app/Notification.java"),
-        java_dir.join("stubs/android/app/NotificationChannel.java"),
-        java_dir.join("stubs/android/app/NotificationManager.java"),
-        java_dir.join("stubs/android/R.java"),
-        // AndroidX stubs
-        java_dir.join("stubs/androidx/annotation/NonNull.java"),
-        java_dir.join("stubs/androidx/work/Data.java"),
-        java_dir.join("stubs/androidx/work/WorkerParameters.java"),
-        java_dir.join("stubs/androidx/work/ListenableWorker.java"),
-        java_dir.join("stubs/androidx/work/Worker.java"),
-        java_dir.join("stubs/androidx/work/WorkerFactory.java"),
-        java_dir.join("stubs/androidx/work/Configuration.java"),
-        java_dir.join("stubs/androidx/work/WorkInfo.java"),
-        java_dir.join("stubs/androidx/work/ForegroundInfo.java"),
-        java_dir.join("stubs/androidx/core/app/NotificationCompat.java"),
-        // Guava stubs (for WorkManager)
-        java_dir.join("stubs/com/google/common/util/concurrent/ListenableFuture.java"),
         // Our callback implementation
         java_dir.join("se/brendan/frakt/RustUrlRequestCallback.java"),
-        // WorkManager download components
-        java_dir.join("se/brendan/frakt/DownloadWorker.java"),
-        java_dir.join("se/brendan/frakt/DownloadProgressCallback.java"),
-        java_dir.join("se/brendan/frakt/DexWorkerFactory.java"),
-        java_dir.join("se/brendan/frakt/BackgroundDownloader.java"),
         // Upload progress tracking
         java_dir.join("se/brendan/frakt/ProgressTrackingUploadDataProvider.java"),
     ];
