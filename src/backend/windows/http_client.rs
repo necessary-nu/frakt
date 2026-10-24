@@ -13,7 +13,7 @@
 //! - The connection handle belongs to the context, so it is closed only after
 //!   the request handle has finished closing.
 
-use crate::backend::types::{BackendRequest, BackendResponse, channel_body};
+use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting, channel_body};
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -229,6 +229,14 @@ pub(crate) async fn execute(
         object.push_str(query);
     }
 
+    // WinHTTP adds its own codings to any Accept-Encoding the caller sent
+    // when it decompresses (an explicit identity went out as "identity,
+    // gzip, deflate"), so it only decompresses requests that left the
+    // choice to frakt.
+    let decompress = !request.headers.contains_key(http::header::ACCEPT_ENCODING)
+        && !config
+            .default_headers
+            .is_some_and(|headers| headers.contains_key(http::header::ACCEPT_ENCODING));
     let (upload, content_type) = encode_body(request.body)?;
     let cookies = config
         .cookie_storage
@@ -311,6 +319,14 @@ pub(crate) async fn execute(
         WINHTTP_OPTION_DISABLE_FEATURE,
         WINHTTP_DISABLE_COOKIES,
     )?;
+    if decompress {
+        // Fails before Windows 8.1, which then gets bodies as sent.
+        let _ = set_option_u32(
+            handle.raw(),
+            WINHTTP_OPTION_DECOMPRESSION,
+            WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE,
+        );
+    }
     if config.ignore_certificate_errors {
         set_option_u32(
             handle.raw(),
@@ -377,26 +393,46 @@ pub(crate) async fn execute(
         let _ = storage.process_response_headers(&final_url, &response_headers);
     }
 
-    let expected_len = if head_request
+    let has_body = !(head_request
         || status.is_informational()
         || status == StatusCode::NO_CONTENT
-        || status == StatusCode::NOT_MODIFIED
-        || response_headers.contains_key(http::header::CONTENT_ENCODING)
-    {
-        None
+        || status == StatusCode::NOT_MODIFIED);
+    let content_length = crate::backend::types::content_length(&response_headers);
+
+    // WinHTTP removes Content-Encoding and Content-Length from a body it
+    // decompresses, so only its counters tell: WinHttpResponseBodyCompressedSize
+    // grows once it has decoded compressed bytes. A body that kept its
+    // Content-Length was not decoded; for any other, read the first chunk to
+    // find out.
+    let mut first = None;
+    let decoded = if decompress && has_body && content_length.is_none() {
+        let chunk = read_chunk(&handle, &context, &mut events).await;
+        let decoded = chunk.is_ok() && body_stats(handle.raw()).is_some_and(|stats| stats.wire > 0);
+        first = Some(chunk);
+        decoded
     } else {
-        response_headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
+        false
     };
 
+    let accounting = BodyAccounting::new(decoded, content_length);
     let (tx, rx) = mpsc::channel(BODY_CHANNEL_CHUNKS);
-    tokio::spawn(read_body(handle, context, events, tx, expected_len));
+    tokio::spawn(read_body(
+        BodyReader {
+            handle,
+            context,
+            events,
+            accounting: accounting.clone(),
+            decoded,
+            expected_len: content_length.filter(|_| has_body),
+            received: 0,
+        },
+        first,
+        tx,
+    ));
 
     Ok(BackendResponse {
         status,
-        accounting: crate::backend::types::BodyAccounting::undecoded(&response_headers),
+        accounting,
         headers: response_headers,
         url: final_url,
         body: channel_body(rx),
@@ -404,69 +440,135 @@ pub(crate) async fn execute(
     })
 }
 
-/// Read the body into `tx`, one `WinHttpReadData` per reserved channel slot.
-async fn read_body(
+/// Body bytes so far, from WINHTTP_OPTION_REQUEST_STATS (Windows 10 1903
+/// and later).
+struct BodyCounts {
+    /// Bytes received over the network; 0 unless WinHTTP decompressed.
+    wire: u64,
+}
+
+fn body_stats(handle: *mut c_void) -> Option<BodyCounts> {
+    let mut stats = WINHTTP_REQUEST_STATS {
+        // An input: how many entries to fill.
+        cStats: WinHttpRequestStatLast.0 as u32,
+        ..Default::default()
+    };
+    let mut size = std::mem::size_of::<WINHTTP_REQUEST_STATS>() as u32;
+    unsafe {
+        WinHttpQueryOption(
+            handle,
+            WINHTTP_OPTION_REQUEST_STATS,
+            Some(&mut stats as *mut WINHTTP_REQUEST_STATS as *mut c_void),
+            &mut size,
+        )
+    }
+    .ok()?;
+    Some(BodyCounts {
+        wire: stats.rgullStats[WinHttpResponseBodyCompressedSize.0 as usize],
+    })
+}
+
+/// Issue one `WinHttpReadData` and wait for it; an empty chunk is the end.
+async fn read_chunk(
+    handle: &RequestHandle,
+    context: &RequestContext,
+    events: &mut mpsc::UnboundedReceiver<Event>,
+) -> Result<Bytes> {
+    unsafe {
+        WinHttpReadData(
+            handle.raw(),
+            context.read_buffer as *mut c_void,
+            READ_BUFFER_SIZE as u32,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(map_windows_error)?;
+    match events.recv().await {
+        Some(Event::Read(data)) => Ok(data),
+        Some(Event::Failed(code)) => Err(map_winhttp_error(code)),
+        Some(_) => Err(Error::Internal(
+            "Unexpected WinHTTP notification while reading".to_string(),
+        )),
+        None => Err(Error::Internal("WinHTTP notifications stopped".to_string())),
+    }
+}
+
+/// What reading a body needs; dropping it closes the request handle.
+struct BodyReader {
     handle: RequestHandle,
     context: Arc<RequestContext>,
-    mut events: mpsc::UnboundedReceiver<Event>,
-    tx: mpsc::Sender<Result<Bytes>>,
+    events: mpsc::UnboundedReceiver<Event>,
+    accounting: Arc<BodyAccounting>,
+    decoded: bool,
+    /// The Content-Length of a body delivered as sent.
     expected_len: Option<u64>,
+    received: u64,
+}
+
+impl BodyReader {
+    /// Account for a chunk, or for the end of the body if `chunk` is empty;
+    /// the error for a body that ended short.
+    fn record(&mut self, chunk: &Bytes) -> Option<Error> {
+        self.received += chunk.len() as u64;
+        if self.decoded {
+            if let Some(stats) = body_stats(self.handle.raw()) {
+                self.accounting.set_wire_bytes(stats.wire);
+            }
+        } else {
+            self.accounting.set_wire_bytes(self.received);
+        }
+        if !chunk.is_empty() {
+            return None;
+        }
+        let expected = self.expected_len?;
+        (self.received < expected).then(|| Error::Network {
+            code: i64::from(ERROR_WINHTTP_CONNECTION_ERROR),
+            message: format!(
+                "connection closed after {} of {} body bytes",
+                self.received, expected
+            ),
+        })
+    }
+}
+
+/// Read the body into `tx`, one `WinHttpReadData` per reserved channel slot,
+/// starting with `first` if the first chunk was already read.
+async fn read_body(
+    mut reader: BodyReader,
+    mut first: Option<Result<Bytes>>,
+    tx: mpsc::Sender<Result<Bytes>>,
 ) {
-    let mut received = 0u64;
     loop {
         let Ok(permit) = tx.reserve().await else {
             return;
         };
 
-        if let Err(error) = unsafe {
-            WinHttpReadData(
-                handle.raw(),
-                context.read_buffer as *mut c_void,
-                READ_BUFFER_SIZE as u32,
-                std::ptr::null_mut(),
-            )
-        } {
-            permit.send(Err(map_windows_error(error)));
-            return;
-        }
-
-        let event = tokio::select! {
-            event = events.recv() => event,
-            // The consumer went away mid-read; returning closes the handle,
-            // which cancels the read.
-            _ = tx.closed() => return,
+        let chunk = match first.take() {
+            Some(chunk) => chunk,
+            None => tokio::select! {
+                chunk = read_chunk(&reader.handle, &reader.context, &mut reader.events) => chunk,
+                // The consumer went away mid-read; returning closes the
+                // handle, which cancels the read.
+                _ = tx.closed() => return,
+            },
         };
 
-        match event {
-            Some(Event::Read(data)) if data.is_empty() => {
-                if let Some(expected) = expected_len {
-                    if received < expected {
-                        permit.send(Err(Error::Network {
-                            code: i64::from(ERROR_WINHTTP_CONNECTION_ERROR),
-                            message: format!(
-                                "connection closed after {} of {} body bytes",
-                                received, expected
-                            ),
-                        }));
-                    }
+        match chunk {
+            Ok(data) => {
+                let end = data.is_empty();
+                if let Some(error) = reader.record(&data) {
+                    permit.send(Err(error));
+                    return;
                 }
-                return;
-            }
-            Some(Event::Read(data)) => {
-                received += data.len() as u64;
+                if end {
+                    return;
+                }
                 permit.send(Ok(data));
             }
-            Some(Event::Failed(code)) => {
-                permit.send(Err(map_winhttp_error(code)));
+            Err(error) => {
+                permit.send(Err(error));
                 return;
             }
-            Some(_) => {
-                permit.send(Err(Error::Internal(
-                    "Unexpected WinHTTP notification while reading".to_string(),
-                )));
-                return;
-            }
-            None => return,
         }
     }
 }
