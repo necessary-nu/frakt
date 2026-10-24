@@ -187,3 +187,12 @@ pub fn handle_events_for_background_session(
 ) {
     platform::handle_events_for_background_session(identifier, completion_handler)
 }
+
+/// Cancel a job as the system does when the user force-quits the app
+/// (producing resume data, so it fails resumably). Only for exercising
+/// resumption where force-quitting is not available, such as the simulator.
+#[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
+#[doc(hidden)]
+pub fn cancel_producing_resume_data(identifier: &str, job: &str) -> bool {
+    platform::cancel_producing_resume_data(identifier, job)
+}

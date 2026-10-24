@@ -667,6 +667,26 @@ impl Drop for Downloads {
     }
 }
 
+/// Cancel a job's task the way the system does when the user force-quits
+/// the app, by producing resume data, so that the job fails resumably.
+/// Returns whether the job had a task to cancel.
+pub(crate) fn cancel_producing_resume_data(identifier: &str, job: &str) -> bool {
+    let Some(session) = lock(&SESSIONS).get(identifier).cloned() else {
+        return false;
+    };
+    let Some(task) = lock(&session.state.tasks).get(job).cloned() else {
+        return false;
+    };
+    let Some(task) = task.downcast_ref::<NSURLSessionDownloadTask>() else {
+        return false;
+    };
+    // The resume data also arrives with the cancellation error, where the
+    // delegate keeps it like any other.
+    let ignore = RcBlock::new(|_: *mut NSData| {});
+    autoreleasepool(|_| unsafe { task.cancelByProducingResumeData(&ignore) });
+    true
+}
+
 static NEXT_CLIENT_JOB: AtomicU64 = AtomicU64::new(1);
 
 /// `Client::download_background` on Apple platforms: a job on the shared
