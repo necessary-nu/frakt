@@ -441,13 +441,16 @@ async fn mid_body_drop_is_an_error(backend: BackendType) {
             "chunked, keep-alive, FIN",
             format!("/chunked?len={}&cut={}&keepalive=1", len, MIB),
         ),
+        // A reset is sent after a cut small enough to sit in the socket
+        // buffers: one that meets full receive buffers can arrive late (on
+        // macOS loopback, for every client).
         (
             "chunked, close, RST",
-            format!("/chunked?len={}&cut={}&rst=1", len, MIB),
+            format!("/chunked?len={}&cut={}&rst=1", len, 64 * 1024),
         ),
         (
             "chunked, keep-alive, RST",
-            format!("/chunked?len={}&cut={}&keepalive=1&rst=1", len, MIB),
+            format!("/chunked?len={}&cut={}&keepalive=1&rst=1", len, 64 * 1024),
         ),
     ];
     for (case, path) in &cases {
