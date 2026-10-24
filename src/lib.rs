@@ -250,6 +250,11 @@ pub use http;
 
 mod auth;
 pub mod backend;
+#[cfg(any(
+    all(feature = "backend-foundation", target_vendor = "apple"),
+    all(feature = "backend-android", target_os = "android")
+))]
+pub mod background;
 mod body;
 mod client;
 mod cookies;

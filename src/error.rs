@@ -131,6 +131,11 @@ pub enum Error {
     #[error("HTTP error: {}", .0.status())]
     HttpError(Box<crate::Response>),
 
+    /// HTTP error status where there is no [`Response`](crate::Response) to
+    /// hand over, as for a background download.
+    #[error("HTTP error: {0}")]
+    HttpStatus(http::StatusCode),
+
     /// WebSocket connection was closed.
     ///
     /// This error occurs when attempting to use a WebSocket connection

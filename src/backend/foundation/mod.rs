@@ -5,6 +5,8 @@
 /// Foundation delegate implementations
 pub mod delegate;
 
+pub(crate) mod background;
+
 /// Foundation cookie storage implementation
 pub mod cookies;
 pub use cookies::FoundationCookieStorage;

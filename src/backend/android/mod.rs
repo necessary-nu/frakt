@@ -1,5 +1,6 @@
 //! Android backend using Cronet (Chromium Network Stack)
 
+pub(crate) mod background;
 mod callback;
 mod cronet;
 mod download;
