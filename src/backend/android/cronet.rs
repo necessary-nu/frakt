@@ -2,20 +2,20 @@
 
 use super::callback::java_error;
 use crate::{Error, Result};
-use jni::JNIEnv;
-use jni::objects::{GlobalRef, JObject, JValue};
+use jni::objects::{Global, JObject, JValue};
+use jni::{Env, jni_sig, jni_str};
 
 /// Create the process's Cronet engine.
 ///
 /// The engine is shared by every client, so per-client settings such as the
 /// user agent are applied to each request instead.
-pub fn create_cronet_engine(env: &mut JNIEnv) -> Result<GlobalRef> {
+pub fn create_cronet_engine(env: &mut Env) -> Result<Global<JObject<'static>>> {
     let context = super::application_context()?;
     let builder_class = super::load_app_class(env, "org.chromium.net.CronetEngine$Builder")?;
     let builder = env
         .new_object(
             &builder_class,
-            "(Landroid/content/Context;)V",
+            jni_sig!("(Landroid/content/Context;)V"),
             &[JValue::Object(context.as_obj())],
         )
         .map_err(|e| java_error(env, "CronetEngine.Builder", e))?;
@@ -23,7 +23,12 @@ pub fn create_cronet_engine(env: &mut JNIEnv) -> Result<GlobalRef> {
     configure_cronet_builder(env, &builder, context)?;
 
     let engine = env
-        .call_method(&builder, "build", "()Lorg/chromium/net/CronetEngine;", &[])
+        .call_method(
+            &builder,
+            jni_str!("build"),
+            jni_sig!("()Lorg/chromium/net/CronetEngine;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(|e| java_error(env, "CronetEngine.Builder.build", e))?;
     env.new_global_ref(&engine)
@@ -31,51 +36,59 @@ pub fn create_cronet_engine(env: &mut JNIEnv) -> Result<GlobalRef> {
 }
 
 fn configure_cronet_builder(
-    env: &mut JNIEnv,
+    env: &mut Env,
     builder: &JObject,
-    context: &GlobalRef,
+    context: &Global<JObject<'static>>,
 ) -> Result<()> {
     let dns_builder_class = super::load_app_class(env, "org.chromium.net.DnsOptions$Builder")?;
     let dns_builder = env
-        .new_object(&dns_builder_class, "()V", &[])
+        .new_object(&dns_builder_class, jni_sig!("()V"), &[])
         .map_err(|e| java_error(env, "DnsOptions.Builder", e))?;
     // The system resolver honours the device's private DNS and VPN settings.
     env.call_method(
         &dns_builder,
-        "useBuiltInDnsResolver",
-        "(Z)Lorg/chromium/net/DnsOptions$Builder;",
-        &[JValue::Bool(0)],
+        jni_str!("useBuiltInDnsResolver"),
+        jni_sig!("(Z)Lorg/chromium/net/DnsOptions$Builder;"),
+        &[JValue::Bool(false)],
     )
     .map_err(|e| java_error(env, "DnsOptions.Builder.useBuiltInDnsResolver", e))?;
     let dns_options = env
         .call_method(
             &dns_builder,
-            "build",
-            "()Lorg/chromium/net/DnsOptions;",
+            jni_str!("build"),
+            jni_sig!("()Lorg/chromium/net/DnsOptions;"),
             &[],
         )
         .and_then(|v| v.l())
         .map_err(|e| java_error(env, "DnsOptions.Builder.build", e))?;
     env.call_method(
         builder,
-        "setDnsOptions",
-        "(Lorg/chromium/net/DnsOptions;)Lorg/chromium/net/CronetEngine$Builder;",
+        jni_str!("setDnsOptions"),
+        jni_sig!("(Lorg/chromium/net/DnsOptions;)Lorg/chromium/net/CronetEngine$Builder;"),
         &[JValue::Object(&dns_options)],
     )
     .map_err(|e| java_error(env, "CronetEngine.Builder.setDnsOptions", e))?;
 
-    for (method, enabled) in [("enableHttp2", true), ("enableQuic", true)] {
+    for (method, enabled) in [
+        (jni_str!("enableHttp2"), true),
+        (jni_str!("enableQuic"), true),
+    ] {
         env.call_method(
             builder,
             method,
-            "(Z)Lorg/chromium/net/CronetEngine$Builder;",
-            &[JValue::Bool(enabled as u8)],
+            jni_sig!("(Z)Lorg/chromium/net/CronetEngine$Builder;"),
+            &[JValue::Bool(enabled)],
         )
-        .map_err(|e| java_error(env, method, e))?;
+        .map_err(|e| java_error(env, &method.to_str(), e))?;
     }
 
     let files_dir = env
-        .call_method(context.as_obj(), "getFilesDir", "()Ljava/io/File;", &[])
+        .call_method(
+            context.as_obj(),
+            jni_str!("getFilesDir"),
+            jni_sig!("()Ljava/io/File;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(|e| java_error(env, "Context.getFilesDir", e))?;
     let storage = env
@@ -83,21 +96,26 @@ fn configure_cronet_builder(
         .map_err(|e| java_error(env, "NewString", e))?;
     let storage = env
         .new_object(
-            "java/io/File",
-            "(Ljava/io/File;Ljava/lang/String;)V",
+            jni_str!("java/io/File"),
+            jni_sig!("(Ljava/io/File;Ljava/lang/String;)V"),
             &[JValue::Object(&files_dir), JValue::Object(&storage)],
         )
         .map_err(|e| java_error(env, "File", e))?;
-    env.call_method(&storage, "mkdirs", "()Z", &[])
+    env.call_method(&storage, jni_str!("mkdirs"), jni_sig!("()Z"), &[])
         .map_err(|e| java_error(env, "File.mkdirs", e))?;
     let storage_path = env
-        .call_method(&storage, "getAbsolutePath", "()Ljava/lang/String;", &[])
+        .call_method(
+            &storage,
+            jni_str!("getAbsolutePath"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(|e| java_error(env, "File.getAbsolutePath", e))?;
     env.call_method(
         builder,
-        "setStoragePath",
-        "(Ljava/lang/String;)Lorg/chromium/net/CronetEngine$Builder;",
+        jni_str!("setStoragePath"),
+        jni_sig!("(Ljava/lang/String;)Lorg/chromium/net/CronetEngine$Builder;"),
         &[JValue::Object(&storage_path)],
     )
     .map_err(|e| java_error(env, "CronetEngine.Builder.setStoragePath", e))?;
@@ -108,8 +126,8 @@ fn configure_cronet_builder(
     const HTTP_CACHE_DISABLED: i32 = 0;
     env.call_method(
         builder,
-        "enableHttpCache",
-        "(IJ)Lorg/chromium/net/CronetEngine$Builder;",
+        jni_str!("enableHttpCache"),
+        jni_sig!("(IJ)Lorg/chromium/net/CronetEngine$Builder;"),
         &[JValue::Int(HTTP_CACHE_DISABLED), JValue::Long(0)],
     )
     .map_err(|e| java_error(env, "CronetEngine.Builder.enableHttpCache", e))?;
@@ -118,17 +136,13 @@ fn configure_cronet_builder(
 }
 
 /// Find the application context through `ActivityThread.currentApplication()`.
-pub(crate) fn find_application_context() -> Result<GlobalRef> {
-    let jvm = super::get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread_as_daemon()
-        .map_err(|e| Error::Internal(format!("Failed to attach to the JVM: {}", e)))?;
-    super::local_frame(&mut env, 8, |env| {
+pub(crate) fn find_application_context() -> Result<Global<JObject<'static>>> {
+    super::attached(super::get_global_vm()?, 8, |env| {
         let application = env
             .call_static_method(
-                "android/app/ActivityThread",
-                "currentApplication",
-                "()Landroid/app/Application;",
+                jni_str!("android/app/ActivityThread"),
+                jni_str!("currentApplication"),
+                jni_sig!("()Landroid/app/Application;"),
                 &[],
             )
             .and_then(|v| v.l())

@@ -44,8 +44,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JValue};
+use jni::{Env, jni_sig, jni_str};
 use serde::Deserialize;
 use tokio::sync::oneshot;
 use url::Url;
@@ -246,8 +246,8 @@ impl Downloads {
             let directory = env
                 .call_static_method(
                     helper,
-                    "directory",
-                    "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
+                    jni_str!("directory"),
+                    jni_sig!("(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;"),
                     &[JValue::Object(context), JValue::Object(&identifier)],
                 )
                 .and_then(|v| v.l())
@@ -324,8 +324,8 @@ impl Downloads {
             let failure = env
                 .call_static_method(
                     helper,
-                    "enqueue",
-                    "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    jni_str!("enqueue"),
+                    jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
                     &[
                         JValue::Object(context),
                         JValue::Object(&identifier),
@@ -355,8 +355,8 @@ impl Downloads {
             let failure = env
                 .call_static_method(
                     helper,
-                    "cancel",
-                    "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    jni_str!("cancel"),
+                    jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
                     &[
                         JValue::Object(context),
                         JValue::Object(&identifier),
@@ -411,7 +411,7 @@ impl Drop for Downloads {
     }
 }
 
-fn new_string<'a>(env: &mut JNIEnv<'a>, value: Option<&str>) -> Result<JObject<'a>> {
+fn new_string<'a>(env: &mut Env<'a>, value: Option<&str>) -> Result<JObject<'a>> {
     match value {
         Some(value) => env
             .new_string(value)
@@ -422,13 +422,10 @@ fn new_string<'a>(env: &mut JNIEnv<'a>, value: Option<&str>) -> Result<JObject<'
 }
 
 /// Run `f` with the application context and the `FraktBackground` class.
-fn with_helper<T>(f: impl FnOnce(&mut JNIEnv, &JObject, &JClass) -> Result<T>) -> Result<T> {
+fn with_helper<T>(f: impl FnOnce(&mut Env, &JObject, &JClass) -> Result<T>) -> Result<T> {
     let jvm = super::get_global_vm()?;
     let context = super::application_context()?;
-    let mut env = jvm
-        .attach_current_thread_as_daemon()
-        .map_err(|e| Error::Internal(format!("Failed to attach to the JVM: {}", e)))?;
-    super::local_frame(&mut env, 16, |env| {
+    super::attached(jvm, 16, |env| {
         let helper = super::load_app_class(env, HELPER).map_err(|error| {
             Error::Internal(format!(
                 "{} is not in the app ({}); include the android/frakt-background module",

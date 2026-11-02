@@ -48,23 +48,24 @@ fn client(backend: BackendType) -> Client {
 fn permit_cleartext() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let vm = unsafe { jni::JavaVM::from_raw(vampire::java_vm() as *mut _) }.unwrap();
-        let mut env = vm.attach_current_thread_as_daemon().unwrap();
-        let policy = env
-            .call_static_method(
-                "android/security/NetworkSecurityPolicy",
-                "getInstance",
-                "()Landroid/security/NetworkSecurityPolicy;",
-                &[],
-            )
-            .and_then(|v| v.l())
-            .unwrap();
-        env.call_method(
-            &policy,
-            "setCleartextTrafficPermitted",
-            "(Z)V",
-            &[true.into()],
-        )
+        let vm = unsafe { jni::JavaVM::from_raw(vampire::java_vm() as *mut _) };
+        vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            let policy = env
+                .call_static_method(
+                    jni::jni_str!("android/security/NetworkSecurityPolicy"),
+                    jni::jni_str!("getInstance"),
+                    jni::jni_sig!("()Landroid/security/NetworkSecurityPolicy;"),
+                    &[],
+                )
+                .and_then(|v| v.l())?;
+            env.call_method(
+                &policy,
+                jni::jni_str!("setCleartextTrafficPermitted"),
+                jni::jni_sig!("(Z)V"),
+                &[true.into()],
+            )?;
+            Ok(())
+        })
         .unwrap();
     });
 }

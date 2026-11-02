@@ -14,9 +14,9 @@ mod harness {
     use frakt::background::{
         BackgroundDownloads, BackgroundHandler, BackgroundJob, FinishedDownload,
     };
-    use jni::JNIEnv;
+    use jni::errors::LogErrorAndDefault;
     use jni::objects::{JClass, JObject, JString};
-    use jni::sys::jstring;
+    use jni::{Env, EnvUnowned};
 
     static DOWNLOADS: Mutex<Option<BackgroundDownloads>> = Mutex::new(None);
 
@@ -62,97 +62,113 @@ mod harness {
         }
     }
 
-    fn string(env: &mut JNIEnv, value: &JString) -> String {
-        env.get_string(value).map(Into::into).unwrap_or_default()
+    /// Run a native method's body with its JNI environment; a panic aborts,
+    /// as from any `extern "system"` function.
+    fn native<'local>(
+        mut env: EnvUnowned<'local>,
+        f: impl FnOnce(&mut Env<'local>) -> JString<'local>,
+    ) -> JString<'local> {
+        env.with_env_no_catch(|env| Ok::<_, jni::errors::Error>(f(env)))
+            .resolve::<LogErrorAndDefault>()
     }
 
-    fn reply(env: &mut JNIEnv, result: Result<String, String>) -> jstring {
+    fn string(env: &mut Env, value: &JString) -> String {
+        value.try_to_string(env).unwrap_or_default()
+    }
+
+    fn reply<'local>(env: &mut Env<'local>, result: Result<String, String>) -> JString<'local> {
         let text = match result {
             Ok(text) => text,
             Err(error) => format!("error: {}", error),
         };
-        env.new_string(text)
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut())
+        env.new_string(text).unwrap_or_default()
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_start(
-        mut env: JNIEnv,
-        _class: JClass,
-        context: JObject,
-        identifier: JString,
-        files_dir: JString,
-    ) -> jstring {
-        let identifier = string(&mut env, &identifier);
-        let log = PathBuf::from(string(&mut env, &files_dir)).join("events.jsonl");
-        let result = (|| {
-            frakt::backend::android::init(&mut env, &context).map_err(|e| e.to_string())?;
-            let mut downloads = DOWNLOADS.lock().unwrap();
-            if downloads.is_none() {
-                *downloads = Some(
-                    BackgroundDownloads::new(&identifier, Arc::new(Recorder { log }))
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-            Ok("started".to_string())
-        })();
-        reply(&mut env, result)
+    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_start<'local>(
+        env: EnvUnowned<'local>,
+        _class: JClass<'local>,
+        context: JObject<'local>,
+        identifier: JString<'local>,
+        files_dir: JString<'local>,
+    ) -> JString<'local> {
+        native(env, |env| {
+            let identifier = string(env, &identifier);
+            let log = PathBuf::from(string(env, &files_dir)).join("events.jsonl");
+            let result = (|| {
+                frakt::backend::android::init(env, &context).map_err(|e| e.to_string())?;
+                let mut downloads = DOWNLOADS.lock().unwrap();
+                if downloads.is_none() {
+                    *downloads = Some(
+                        BackgroundDownloads::new(&identifier, Arc::new(Recorder { log }))
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                Ok("started".to_string())
+            })();
+            reply(env, result)
+        })
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_enqueue(
-        mut env: JNIEnv,
-        _class: JClass,
-        job: JString,
-        url: JString,
-    ) -> jstring {
-        let job = string(&mut env, &job);
-        let url = string(&mut env, &url);
-        let result = (|| {
-            let url = url.parse().map_err(|e: url::ParseError| e.to_string())?;
-            let downloads = DOWNLOADS.lock().unwrap();
-            let downloads = downloads.as_ref().ok_or("not started")?;
-            downloads
-                .enqueue(BackgroundJob::new(job.clone(), url))
-                .map_err(|e| e.to_string())?;
-            Ok(format!("enqueued {}", job))
-        })();
-        reply(&mut env, result)
+    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_enqueue<'local>(
+        env: EnvUnowned<'local>,
+        _class: JClass<'local>,
+        job: JString<'local>,
+        url: JString<'local>,
+    ) -> JString<'local> {
+        native(env, |env| {
+            let job = string(env, &job);
+            let url = string(env, &url);
+            let result = (|| {
+                let url = url.parse().map_err(|e: url::ParseError| e.to_string())?;
+                let downloads = DOWNLOADS.lock().unwrap();
+                let downloads = downloads.as_ref().ok_or("not started")?;
+                downloads
+                    .enqueue(BackgroundJob::new(job.clone(), url))
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("enqueued {}", job))
+            })();
+            reply(env, result)
+        })
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_cancel(
-        mut env: JNIEnv,
-        _class: JClass,
-        job: JString,
-    ) -> jstring {
-        let job = string(&mut env, &job);
-        let result = (|| {
-            let downloads = DOWNLOADS.lock().unwrap();
-            let downloads = downloads.as_ref().ok_or("not started")?;
-            downloads.cancel(&job).map_err(|e| e.to_string())?;
-            Ok(format!("cancelled {}", job))
-        })();
-        reply(&mut env, result)
+    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_cancel<'local>(
+        env: EnvUnowned<'local>,
+        _class: JClass<'local>,
+        job: JString<'local>,
+    ) -> JString<'local> {
+        native(env, |env| {
+            let job = string(env, &job);
+            let result = (|| {
+                let downloads = DOWNLOADS.lock().unwrap();
+                let downloads = downloads.as_ref().ok_or("not started")?;
+                downloads.cancel(&job).map_err(|e| e.to_string())?;
+                Ok(format!("cancelled {}", job))
+            })();
+            reply(env, result)
+        })
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_jobs(
-        mut env: JNIEnv,
-        _class: JClass,
-    ) -> jstring {
-        let result = (|| {
-            let downloads = DOWNLOADS.lock().unwrap();
-            let downloads = downloads.as_ref().ok_or("not started")?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let jobs = runtime
-                .block_on(downloads.jobs())
-                .map_err(|e| e.to_string())?;
-            Ok(format!("{:?}", jobs))
-        })();
-        reply(&mut env, result)
+    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_jobs<'local>(
+        env: EnvUnowned<'local>,
+        _class: JClass<'local>,
+    ) -> JString<'local> {
+        native(env, |env| {
+            let result = (|| {
+                let downloads = DOWNLOADS.lock().unwrap();
+                let downloads = downloads.as_ref().ok_or("not started")?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let jobs = runtime
+                    .block_on(downloads.jobs())
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("{:?}", jobs))
+            })();
+            reply(env, result)
+        })
     }
 }

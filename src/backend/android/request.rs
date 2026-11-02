@@ -6,9 +6,9 @@ use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::Stream;
-use jni::objects::{GlobalRef, JValue};
+use jni::objects::{Global, JObject, JValue};
 use jni::sys::jlong;
-use jni::{JNIEnv, JavaVM};
+use jni::{Env, JavaVM, jni_sig, jni_str};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,14 +29,14 @@ impl RequestGuard {
         let Some(request) = self.shared.url_request.get() else {
             return;
         };
-        if let Ok(mut env) = self.jvm.attach_current_thread_as_daemon() {
-            let _ = super::local_frame(&mut env, 8, |env| {
-                if let Err(error) = env.call_method(request.as_obj(), "cancel", "()V", &[]) {
-                    java_error(env, "UrlRequest.cancel", error);
-                }
-                Ok(())
-            });
-        }
+        let _ = super::attached(self.jvm, 8, |env| {
+            if let Err(error) =
+                env.call_method(request.as_obj(), jni_str!("cancel"), jni_sig!("()V"), &[])
+            {
+                java_error(env, "UrlRequest.cancel", error);
+            }
+            Ok(())
+        });
     }
 }
 
@@ -57,7 +57,7 @@ impl Drop for RequestGuard {
 /// wait for the next body chunk.
 pub async fn execute_request(
     jvm: &'static JavaVM,
-    cronet_engine: &GlobalRef,
+    cronet_engine: &Global<JObject<'static>>,
     request: BackendRequest,
     read_timeout: Option<Duration>,
 ) -> Result<BackendResponse> {
@@ -70,14 +70,9 @@ pub async fn execute_request(
         shared: shared.clone(),
     };
 
-    {
-        let mut env = jvm
-            .attach_current_thread_as_daemon()
-            .map_err(|e| Error::Internal(format!("Failed to attach to the JVM: {}", e)))?;
-        super::local_frame(&mut env, 32, |env| {
-            start_request(env, cronet_engine, request, id, &shared)
-        })?;
-    }
+    super::attached(jvm, 32, |env| {
+        start_request(env, cronet_engine, request, id, &shared)
+    })?;
 
     let mut idle = IdleTimer::new(read_timeout);
     let (head, redirect_headers, accounting) = std::future::poll_fn(|cx| {
@@ -196,17 +191,12 @@ impl Stream for CronetBody {
         };
 
         if read {
-            match this.guard.jvm.attach_current_thread_as_daemon() {
-                Ok(mut env) => {
-                    let _ = super::local_frame(&mut env, 8, |env| {
-                        shared.issue_read(env);
-                        Ok(())
-                    });
-                }
-                Err(error) => shared.finish(Err(Error::Internal(format!(
-                    "Failed to attach to the JVM: {}",
-                    error
-                )))),
+            let attached = super::attached(this.guard.jvm, 8, |env| {
+                shared.issue_read(env);
+                Ok(())
+            });
+            if let Err(error) = attached {
+                shared.finish(Err(error));
             }
         }
 
@@ -278,8 +268,8 @@ fn body_bytes(body: crate::body::Body) -> Result<Option<(Vec<u8>, Option<String>
 /// Build the `UrlRequest`, hand its read buffer and handle to `shared`, and
 /// start it.
 fn start_request(
-    env: &mut JNIEnv,
-    cronet_engine: &GlobalRef,
+    env: &mut Env,
+    cronet_engine: &Global<JObject<'static>>,
     request: BackendRequest,
     id: jlong,
     shared: &RequestShared,
@@ -331,12 +321,12 @@ fn start_request(
                 .byte_array_from_slice(&bytes)
                 .map_err(|e| java_error(env, "NewByteArray", e))?;
             let class = callback::upload_provider_class(env)?;
-            let class = jni::objects::JClass::from(
-                env.new_local_ref(class.as_obj())
-                    .map_err(|e| java_error(env, "NewLocalRef", e))?,
-            );
-            env.new_object(&class, "([BJ)V", &[JValue::Object(&data), JValue::Long(id)])
-                .map_err(|e| java_error(env, "ProgressTrackingUploadDataProvider", e))
+            env.new_object(
+                class,
+                jni_sig!("([BJ)V"),
+                &[JValue::Object(&data), JValue::Long(id)],
+            )
+            .map_err(|e| java_error(env, "ProgressTrackingUploadDataProvider", e))
         })?;
         builder
             .set_upload_data_provider(&provider, executor.as_obj())
@@ -349,9 +339,9 @@ fn start_request(
 
     let buffer = env
         .call_static_method(
-            "java/nio/ByteBuffer",
-            "allocateDirect",
-            "(I)Ljava/nio/ByteBuffer;",
+            jni_str!("java/nio/ByteBuffer"),
+            jni_str!("allocateDirect"),
+            jni_sig!("(I)Ljava/nio/ByteBuffer;"),
             &[JValue::Int(READ_BUFFER_SIZE)],
         )
         .and_then(|v| v.l())
@@ -365,7 +355,7 @@ fn start_request(
         .map_err(|e| java_error(env, "NewGlobalRef", e))?;
     let _ = shared.url_request.set(global_request);
 
-    env.call_method(&url_request, "start", "()V", &[])
+    env.call_method(&url_request, jni_str!("start"), jni_sig!("()V"), &[])
         .map_err(|e| java_error(env, "UrlRequest.start", e))?;
     Ok(())
 }

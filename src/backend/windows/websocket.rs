@@ -5,7 +5,7 @@ use crate::{
     websocket::{CloseCode, Message},
 };
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicI32, Ordering},
@@ -172,9 +172,8 @@ impl WindowsWebSocket {
                 // Add WebSocket headers for proper handshake
                 // Generate a cryptographically random 16-byte key as per RFC 6455
                 let mut key_bytes = [0u8; 16];
-                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key_bytes);
-                let websocket_key =
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key_bytes);
+                rand::rng().fill_bytes(&mut key_bytes);
+                let websocket_key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
                 let headers = format!(
                     "Connection: Upgrade\r\n\
                      Upgrade: websocket\r\n\

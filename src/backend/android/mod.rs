@@ -11,17 +11,17 @@ use crate::backend::types::{BackendRequest, BackendResponse};
 use crate::{Error, Result};
 use callback::java_error;
 use jni::{
-    JNIEnv, JavaVM,
-    objects::{GlobalRef, JClass, JObject, JValue},
+    AttachConfig, Env, JavaVM, jni_sig, jni_str,
+    objects::{Global, JClass, JObject, JObjectArray, JString, JValue},
 };
 use std::sync::{Arc, Mutex, OnceLock};
 use url::Url;
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
-static APP_CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
-static APP_CLASS_LOADER: OnceLock<GlobalRef> = OnceLock::new();
-static CALLBACK_EXECUTOR: OnceLock<GlobalRef> = OnceLock::new();
-static CRONET_ENGINE: Mutex<Option<Arc<GlobalRef>>> = Mutex::new(None);
+static APP_CONTEXT: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+static APP_CLASS_LOADER: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+static CALLBACK_EXECUTOR: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+static CRONET_ENGINE: Mutex<Option<Arc<Global<JObject<'static>>>>> = Mutex::new(None);
 
 /// Give the Android backend the JavaVM and an Android `Context`.
 ///
@@ -33,7 +33,7 @@ static CRONET_ENGINE: Mutex<Option<Arc<GlobalRef>>> = Mutex::new(None);
 /// Without it, the backend looks the VM up with `JNI_GetCreatedJavaVMs`
 /// (Android 12 and later) and the context up with
 /// `ActivityThread.currentApplication()`, a non-SDK API.
-pub fn init(env: &mut JNIEnv, context: &JObject) -> Result<()> {
+pub fn init(env: &mut Env, context: &JObject) -> Result<()> {
     let vm = env
         .get_java_vm()
         .map_err(|e| Error::Internal(format!("Failed to get JavaVM: {}", e)))?;
@@ -43,8 +43,8 @@ pub fn init(env: &mut JNIEnv, context: &JObject) -> Result<()> {
         let app = env
             .call_method(
                 context,
-                "getApplicationContext",
-                "()Landroid/content/Context;",
+                jni_str!("getApplicationContext"),
+                jni_sig!("()Landroid/content/Context;"),
                 &[],
             )
             .and_then(|v| v.l())
@@ -106,12 +106,12 @@ fn discover_java_vm() -> Option<JavaVM> {
     if status != jni::sys::JNI_OK || count < 1 || vm.is_null() {
         return None;
     }
-    unsafe { JavaVM::from_raw(vm) }.ok()
+    Some(unsafe { JavaVM::from_raw(vm) })
 }
 
 /// The application context given to [`init`], or the one found through
 /// `ActivityThread`.
-pub(crate) fn application_context() -> Result<&'static GlobalRef> {
+pub(crate) fn application_context() -> Result<&'static Global<JObject<'static>>> {
     if let Some(context) = APP_CONTEXT.get() {
         return Ok(context);
     }
@@ -119,29 +119,41 @@ pub(crate) fn application_context() -> Result<&'static GlobalRef> {
     Ok(APP_CONTEXT.get_or_init(|| context))
 }
 
-/// Run `f` in its own JNI local reference frame.
+/// Run `f` on this thread attached to `jvm`, in a JNI local reference frame
+/// of its own.
 ///
-/// Threads attached from native code never return to Java, so local
-/// references they create are only freed by popping a frame.
-pub(crate) fn local_frame<T>(
-    env: &mut JNIEnv,
-    capacity: i32,
-    f: impl FnOnce(&mut JNIEnv) -> Result<T>,
+/// The thread stays attached. Threads attached from native code never
+/// return to Java, so local references they create are only freed by
+/// popping a frame.
+pub(crate) fn attached<T>(
+    jvm: &JavaVM,
+    capacity: usize,
+    f: impl FnOnce(&mut Env) -> Result<T>,
 ) -> Result<T> {
-    env.push_local_frame(capacity)
-        .map_err(|e| java_error(env, "PushLocalFrame", e))?;
-    let result = f(env);
-    // SAFETY: nothing created in the frame outlives it; results are global
-    // references or Rust values.
-    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-    result
+    jvm.attach_current_thread_with_config(AttachConfig::default, Some(capacity), |env| {
+        Ok::<_, jni::errors::Error>(f(env))
+    })
+    .map_err(|e| Error::Internal(format!("Failed to attach to the JVM: {}", e)))?
+}
+
+/// Run `f` on this thread attached to the JVM, detaching it afterwards if it
+/// was not attached before.
+fn attached_for_scope<T>(f: impl FnOnce(&mut Env) -> Result<T>) -> Result<T> {
+    get_global_vm()?
+        .attach_current_thread_for_scope(|env| Ok::<_, jni::errors::Error>(f(env)))
+        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?
+}
+
+/// The contents of a `java.lang.String`.
+fn string_value(env: &mut Env, object: JObject) -> jni::errors::Result<String> {
+    env.cast_local::<JString>(object)?.try_to_string(env)
 }
 
 /// The application's class loader.
 ///
 /// JNI `FindClass` on a thread attached from native code only sees system
 /// classes, so app classes such as Cronet's are loaded through this instead.
-pub(crate) fn app_class_loader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+pub(crate) fn app_class_loader(env: &mut Env) -> Result<&'static Global<JObject<'static>>> {
     if let Some(loader) = APP_CLASS_LOADER.get() {
         return Ok(loader);
     }
@@ -149,8 +161,8 @@ pub(crate) fn app_class_loader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
     let loader = env
         .call_method(
             context.as_obj(),
-            "getClassLoader",
-            "()Ljava/lang/ClassLoader;",
+            jni_str!("getClassLoader"),
+            jni_sig!("()Ljava/lang/ClassLoader;"),
             &[],
         )
         .and_then(|v| v.l())
@@ -164,8 +176,8 @@ pub(crate) fn app_class_loader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
 /// Load a class by binary name (`org.chromium.net.CronetEngine$Builder`)
 /// through `loader`.
 pub(crate) fn load_class_with<'a>(
-    env: &mut JNIEnv<'a>,
-    loader: &GlobalRef,
+    env: &mut Env<'a>,
+    loader: &Global<JObject<'static>>,
     class_name: &str,
 ) -> Result<JClass<'a>> {
     let name = env
@@ -174,32 +186,33 @@ pub(crate) fn load_class_with<'a>(
     let class = env
         .call_method(
             loader.as_obj(),
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
+            jni_str!("loadClass"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
             &[JValue::Object(&name)],
         )
         .and_then(|v| v.l())
+        .and_then(|class| env.cast_local::<JClass>(class))
         .map_err(|e| java_error(env, &format!("loadClass({})", class_name), e))?;
-    Ok(JClass::from(class))
+    Ok(class)
 }
 
 /// Load an application class, such as Cronet's, from any thread.
-pub(crate) fn load_app_class<'a>(env: &mut JNIEnv<'a>, class_name: &str) -> Result<JClass<'a>> {
+pub(crate) fn load_app_class<'a>(env: &mut Env<'a>, class_name: &str) -> Result<JClass<'a>> {
     let loader = app_class_loader(env)?;
     load_class_with(env, loader, class_name)
 }
 
 /// The executor every request's callbacks and uploads run on. Callbacks only
 /// copy data and hand off to Rust, so one shared pool serves all requests.
-pub(crate) fn callback_executor(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+pub(crate) fn callback_executor(env: &mut Env) -> Result<&'static Global<JObject<'static>>> {
     if let Some(executor) = CALLBACK_EXECUTOR.get() {
         return Ok(executor);
     }
     let executor = env
         .call_static_method(
-            "java/util/concurrent/Executors",
-            "newCachedThreadPool",
-            "()Ljava/util/concurrent/ExecutorService;",
+            jni_str!("java/util/concurrent/Executors"),
+            jni_str!("newCachedThreadPool"),
+            jni_sig!("()Ljava/util/concurrent/ExecutorService;"),
             &[],
         )
         .and_then(|v| v.l())
@@ -211,16 +224,16 @@ pub(crate) fn callback_executor(env: &mut JNIEnv) -> Result<&'static GlobalRef> 
 }
 
 /// The process's Cronet engine, created on first use.
-fn get_global_cronet_engine() -> Result<Arc<GlobalRef>> {
+fn get_global_cronet_engine() -> Result<Arc<Global<JObject<'static>>>> {
     let mut engine = CRONET_ENGINE.lock().unwrap();
     if let Some(engine) = engine.as_ref() {
         return Ok(engine.clone());
     }
-    let jvm = get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread_as_daemon()
-        .map_err(|e| Error::Internal(format!("Failed to attach to the JVM: {}", e)))?;
-    let created = Arc::new(local_frame(&mut env, 32, cronet::create_cronet_engine)?);
+    let created = Arc::new(attached(
+        get_global_vm()?,
+        32,
+        cronet::create_cronet_engine,
+    )?);
     *engine = Some(created.clone());
     Ok(created)
 }
@@ -228,353 +241,321 @@ fn get_global_cronet_engine() -> Result<Arc<GlobalRef>> {
 /// Start NetLog for debugging network issues
 /// Returns the path to the NetLog file
 pub fn start_netlog() -> Result<String> {
-    let jvm = get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
+    attached_for_scope(|env| {
+        let engine = get_global_cronet_engine()?;
 
-    let engine = get_global_cronet_engine()?;
+        // Get the application context to access files directory
+        let context = application_context()?;
 
-    // Get the application context to access files directory
-    let context = application_context()?;
+        // Get external files directory
+        let files_dir = env
+            .call_method(
+                context.as_obj(),
+                jni_str!("getExternalFilesDir"),
+                jni_sig!("(Ljava/lang/String;)Ljava/io/File;"),
+                &[JValue::Object(&JObject::null())],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to get external files dir: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert files dir: {}", e)))?;
 
-    // Get external files directory
-    let files_dir = env
-        .call_method(
-            context.as_obj(),
-            "getExternalFilesDir",
-            "(Ljava/lang/String;)Ljava/io/File;",
-            &[jni::objects::JValue::Object(&jni::objects::JObject::null())],
+        // Create temp file for NetLog
+        let file_class = env
+            .find_class(jni_str!("java/io/File"))
+            .map_err(|e| Error::Internal(format!("Failed to find File class: {}", e)))?;
+
+        let prefix = env
+            .new_string("cronet")
+            .map_err(|e| Error::Internal(format!("Failed to create prefix string: {}", e)))?;
+        let suffix = env
+            .new_string(".json")
+            .map_err(|e| Error::Internal(format!("Failed to create suffix string: {}", e)))?;
+
+        let temp_file = env
+            .call_static_method(
+                file_class,
+                jni_str!("createTempFile"),
+                jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;"),
+                &[(&prefix).into(), (&suffix).into(), (&files_dir).into()],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to create temp file: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert temp file: {}", e)))?;
+
+        // Get absolute path
+        let path = env
+            .call_method(
+                &temp_file,
+                jni_str!("getAbsolutePath"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to get absolute path: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert path: {}", e)))?;
+
+        let path_string = string_value(env, path)
+            .map_err(|e| Error::Internal(format!("Failed to get path string: {}", e)))?;
+
+        // Start NetLog
+        let path_jstring = env
+            .new_string(&path_string)
+            .map_err(|e| Error::Internal(format!("Failed to create path jstring: {}", e)))?;
+
+        env.call_method(
+            engine.as_obj(),
+            jni_str!("startNetLogToFile"),
+            jni_sig!("(Ljava/lang/String;Z)V"),
+            &[(&path_jstring).into(), false.into()],
         )
-        .map_err(|e| Error::Internal(format!("Failed to get external files dir: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert files dir: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("Failed to start NetLog: {}", e)))?;
 
-    // Create temp file for NetLog
-    let file_class = env
-        .find_class("java/io/File")
-        .map_err(|e| Error::Internal(format!("Failed to find File class: {}", e)))?;
+        tracing::info!("NetLog started, writing to: {}", path_string);
 
-    let prefix = env
-        .new_string("cronet")
-        .map_err(|e| Error::Internal(format!("Failed to create prefix string: {}", e)))?;
-    let suffix = env
-        .new_string(".json")
-        .map_err(|e| Error::Internal(format!("Failed to create suffix string: {}", e)))?;
-
-    let temp_file = env
-        .call_static_method(
-            file_class,
-            "createTempFile",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/io/File;)Ljava/io/File;",
-            &[(&prefix).into(), (&suffix).into(), (&files_dir).into()],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to create temp file: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert temp file: {}", e)))?;
-
-    // Get absolute path
-    let path = env
-        .call_method(&temp_file, "getAbsolutePath", "()Ljava/lang/String;", &[])
-        .map_err(|e| Error::Internal(format!("Failed to get absolute path: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert path: {}", e)))?;
-
-    let path_string: String = env
-        .get_string(&path.into())
-        .map_err(|e| Error::Internal(format!("Failed to get path string: {}", e)))?
-        .into();
-
-    // Start NetLog
-    let path_jstring = env
-        .new_string(&path_string)
-        .map_err(|e| Error::Internal(format!("Failed to create path jstring: {}", e)))?;
-
-    env.call_method(
-        engine.as_obj(),
-        "startNetLogToFile",
-        "(Ljava/lang/String;Z)V",
-        &[(&path_jstring).into(), false.into()],
-    )
-    .map_err(|e| Error::Internal(format!("Failed to start NetLog: {}", e)))?;
-
-    tracing::info!("NetLog started, writing to: {}", path_string);
-
-    Ok(path_string)
+        Ok(path_string)
+    })
 }
 
 /// Stop NetLog
 pub fn stop_netlog() -> Result<()> {
-    let jvm = get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
+    attached_for_scope(|env| {
+        let engine = get_global_cronet_engine()?;
 
-    let engine = get_global_cronet_engine()?;
-
-    env.call_method(engine.as_obj(), "stopNetLog", "()V", &[])
+        env.call_method(
+            engine.as_obj(),
+            jni_str!("stopNetLog"),
+            jni_sig!("()V"),
+            &[],
+        )
         .map_err(|e| Error::Internal(format!("Failed to stop NetLog: {}", e)))?;
 
-    tracing::info!("NetLog stopped");
+        tracing::info!("NetLog stopped");
 
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Check if a specific permission is granted
 pub fn check_permission(permission: &str) -> Result<bool> {
-    let jvm = get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
+    attached_for_scope(|env| {
+        let context = application_context()?;
 
-    let context = application_context()?;
+        let permission_jstring = env
+            .new_string(permission)
+            .map_err(|e| Error::Internal(format!("Failed to create permission string: {}", e)))?;
 
-    let permission_jstring = env
-        .new_string(permission)
-        .map_err(|e| Error::Internal(format!("Failed to create permission string: {}", e)))?;
+        let result = env
+            .call_method(
+                context.as_obj(),
+                jni_str!("checkSelfPermission"),
+                jni_sig!("(Ljava/lang/String;)I"),
+                &[(&permission_jstring).into()],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to check permission: {}", e)))?
+            .i()
+            .map_err(|e| Error::Internal(format!("Failed to get permission result: {}", e)))?;
 
-    let result = env
-        .call_method(
-            context.as_obj(),
-            "checkSelfPermission",
-            "(Ljava/lang/String;)I",
-            &[(&permission_jstring).into()],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to check permission: {}", e)))?
-        .i()
-        .map_err(|e| Error::Internal(format!("Failed to get permission result: {}", e)))?;
-
-    // PERMISSION_GRANTED = 0
-    Ok(result == 0)
+        // PERMISSION_GRANTED = 0
+        Ok(result == 0)
+    })
 }
 
 /// List all granted permissions
 pub fn list_permissions() -> Result<Vec<String>> {
-    let jvm = get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
+    attached_for_scope(|env| {
+        let context = application_context()?;
 
-    let context = application_context()?;
-
-    // Get PackageManager
-    let package_manager = env
-        .call_method(
-            context.as_obj(),
-            "getPackageManager",
-            "()Landroid/content/pm/PackageManager;",
-            &[],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to get PackageManager: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert PackageManager: {}", e)))?;
-
-    // Get package name
-    let package_name = env
-        .call_method(
-            context.as_obj(),
-            "getPackageName",
-            "()Ljava/lang/String;",
-            &[],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to get package name: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert package name: {}", e)))?;
-
-    // Get PackageInfo with PERMISSIONS flag
-    let package_info = env
-        .call_method(
-            &package_manager,
-            "getPackageInfo",
-            "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
-            &[(&package_name).into(), 4096i32.into()], // GET_PERMISSIONS = 4096
-        )
-        .map_err(|e| Error::Internal(format!("Failed to get PackageInfo: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert PackageInfo: {}", e)))?;
-
-    // Get requestedPermissions array using reflection
-    let permissions_array = env.call_method(
-        &package_info,
-        "requestedPermissions",
-        "[Ljava/lang/String;",
-        &[],
-    );
-
-    // If field doesn't exist, try getting it as a field
-    let permissions_obj = if permissions_array.is_err() {
-        let package_info_class = env
-            .get_object_class(&package_info)
-            .map_err(|e| Error::Internal(format!("Failed to get PackageInfo class: {}", e)))?;
-
-        let field_id = env
-            .get_field_id(
-                &package_info_class,
-                "requestedPermissions",
-                "[Ljava/lang/String;",
+        // Get PackageManager
+        let package_manager = env
+            .call_method(
+                context.as_obj(),
+                jni_str!("getPackageManager"),
+                jni_sig!("()Landroid/content/pm/PackageManager;"),
+                &[],
             )
-            .map_err(|e| {
-                Error::Internal(format!("Failed to get requestedPermissions field: {}", e))
-            })?;
+            .map_err(|e| Error::Internal(format!("Failed to get PackageManager: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert PackageManager: {}", e)))?;
 
-        env.get_field_unchecked(&package_info, field_id, jni::signature::ReturnType::Object)
+        // Get package name
+        let package_name = env
+            .call_method(
+                context.as_obj(),
+                jni_str!("getPackageName"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to get package name: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert package name: {}", e)))?;
+
+        // Get PackageInfo with PERMISSIONS flag
+        let package_info = env
+            .call_method(
+                &package_manager,
+                jni_str!("getPackageInfo"),
+                jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;"),
+                &[(&package_name).into(), 4096i32.into()], // GET_PERMISSIONS = 4096
+            )
+            .map_err(|e| Error::Internal(format!("Failed to get PackageInfo: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert PackageInfo: {}", e)))?;
+
+        let permissions_obj = env
+            .get_field(
+                &package_info,
+                jni_str!("requestedPermissions"),
+                jni_sig!("[Ljava/lang/String;"),
+            )
             .map_err(|e| Error::Internal(format!("Failed to read requestedPermissions: {}", e)))?
             .l()
-            .map_err(|e| Error::Internal(format!("Failed to convert permissions array: {}", e)))?
-    } else {
-        permissions_array
-            .map_err(|e| Error::Internal(format!("Failed to get requestedPermissions: {}", e)))?
-            .l()
-            .map_err(|e| Error::Internal(format!("Failed to convert permissions array: {}", e)))?
-    };
+            .map_err(|e| Error::Internal(format!("Failed to convert permissions array: {}", e)))?;
 
-    if permissions_obj.is_null() {
-        return Ok(Vec::new());
-    }
+        if permissions_obj.is_null() {
+            return Ok(Vec::new());
+        }
 
-    let permissions_jarray = jni::objects::JObjectArray::from(permissions_obj);
-    let array_len = env
-        .get_array_length(&permissions_jarray)
-        .map_err(|e| Error::Internal(format!("Failed to get array length: {}", e)))?;
+        let permissions_jarray = env
+            .cast_local::<JObjectArray<JString>>(permissions_obj)
+            .map_err(|e| Error::Internal(format!("Failed to convert permissions array: {}", e)))?;
+        let array_len = permissions_jarray
+            .len(env)
+            .map_err(|e| Error::Internal(format!("Failed to get array length: {}", e)))?;
 
-    let mut permissions = Vec::new();
-    for i in 0..array_len {
-        let permission_obj = env
-            .get_object_array_element(&permissions_jarray, i)
-            .map_err(|e| {
+        let mut permissions = Vec::new();
+        for i in 0..array_len {
+            let permission = permissions_jarray.get_element(env, i).map_err(|e| {
                 Error::Internal(format!("Failed to get permission at index {}: {}", i, e))
             })?;
 
-        if !permission_obj.is_null() {
-            let permission_str: String = env
-                .get_string(&permission_obj.into())
-                .map_err(|e| {
+            if !permission.is_null() {
+                let permission_str = permission.try_to_string(env).map_err(|e| {
                     Error::Internal(format!("Failed to convert permission string: {}", e))
-                })?
-                .into();
-            permissions.push(permission_str);
+                })?;
+                permissions.push(permission_str);
+            }
         }
-    }
 
-    Ok(permissions)
+        Ok(permissions)
+    })
 }
 
 /// Test DNS resolution directly using Java's InetAddress API
 pub fn test_dns(hostname: &str) -> Result<String> {
-    let jvm = get_global_vm()?;
-    let mut env = jvm
-        .attach_current_thread()
-        .map_err(|e| Error::Internal(format!("Failed to attach to JVM thread: {}", e)))?;
+    attached_for_scope(|env| {
+        // Temporarily disable StrictMode network checks
+        let strict_mode_class = env
+            .find_class(jni_str!("android/os/StrictMode"))
+            .map_err(|e| Error::Internal(format!("Failed to find StrictMode class: {}", e)))?;
 
-    // Temporarily disable StrictMode network checks
-    let strict_mode_class = env
-        .find_class("android/os/StrictMode")
-        .map_err(|e| Error::Internal(format!("Failed to find StrictMode class: {}", e)))?;
+        let old_policy = env
+            .call_static_method(
+                &strict_mode_class,
+                jni_str!("getThreadPolicy"),
+                jni_sig!("()Landroid/os/StrictMode$ThreadPolicy;"),
+                &[],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to get thread policy: {}", e)))?;
 
-    let old_policy = env
-        .call_static_method(
+        let policy_builder_class = env
+            .find_class(jni_str!("android/os/StrictMode$ThreadPolicy$Builder"))
+            .map_err(|e| Error::Internal(format!("Failed to find ThreadPolicy.Builder: {}", e)))?;
+
+        let policy_builder = env
+            .new_object(policy_builder_class, jni_sig!("()V"), &[])
+            .map_err(|e| Error::Internal(format!("Failed to create policy builder: {}", e)))?;
+
+        let permissive_policy_builder = env
+            .call_method(
+                &policy_builder,
+                jni_str!("permitNetwork"),
+                jni_sig!("()Landroid/os/StrictMode$ThreadPolicy$Builder;"),
+                &[],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to permit network: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to get builder: {}", e)))?;
+
+        let permissive_policy = env
+            .call_method(
+                &permissive_policy_builder,
+                jni_str!("build"),
+                jni_sig!("()Landroid/os/StrictMode$ThreadPolicy;"),
+                &[],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to build policy: {}", e)))?;
+
+        let permissive_policy_obj = permissive_policy
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to get policy object: {}", e)))?;
+
+        env.call_static_method(
             &strict_mode_class,
-            "getThreadPolicy",
-            "()Landroid/os/StrictMode$ThreadPolicy;",
-            &[],
+            jni_str!("setThreadPolicy"),
+            jni_sig!("(Landroid/os/StrictMode$ThreadPolicy;)V"),
+            &[(&permissive_policy_obj).into()],
         )
-        .map_err(|e| Error::Internal(format!("Failed to get thread policy: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("Failed to set thread policy: {}", e)))?;
 
-    let policy_builder_class = env
-        .find_class("android/os/StrictMode$ThreadPolicy$Builder")
-        .map_err(|e| Error::Internal(format!("Failed to find ThreadPolicy.Builder: {}", e)))?;
+        // Call Inet4Address.getByName(hostname) to force IPv4
+        let hostname_jstring = env
+            .new_string(hostname)
+            .map_err(|e| Error::Internal(format!("Failed to create hostname string: {}", e)))?;
 
-    let policy_builder = env
-        .new_object(policy_builder_class, "()V", &[])
-        .map_err(|e| Error::Internal(format!("Failed to create policy builder: {}", e)))?;
+        let inet4_address_class = env
+            .find_class(jni_str!("java/net/Inet4Address"))
+            .map_err(|e| Error::Internal(format!("Failed to find Inet4Address class: {}", e)))?;
 
-    let permissive_policy_builder = env
-        .call_method(
-            &policy_builder,
-            "permitNetwork",
-            "()Landroid/os/StrictMode$ThreadPolicy$Builder;",
-            &[],
+        let inet_address_result = env.call_static_method(
+            &inet4_address_class,
+            jni_str!("getByName"),
+            jni_sig!("(Ljava/lang/String;)Ljava/net/InetAddress;"),
+            &[(&hostname_jstring).into()],
+        );
+
+        // Restore old policy
+        let old_policy_obj = old_policy
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to get old policy object: {}", e)))?;
+
+        env.call_static_method(
+            &strict_mode_class,
+            jni_str!("setThreadPolicy"),
+            jni_sig!("(Landroid/os/StrictMode$ThreadPolicy;)V"),
+            &[(&old_policy_obj).into()],
         )
-        .map_err(|e| Error::Internal(format!("Failed to permit network: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to get builder: {}", e)))?;
+        .map_err(|e| Error::Internal(format!("Failed to restore thread policy: {}", e)))?;
 
-    let permissive_policy = env
-        .call_method(
-            &permissive_policy_builder,
-            "build",
-            "()Landroid/os/StrictMode$ThreadPolicy;",
-            &[],
-        )
-        .map_err(|e| Error::Internal(format!("Failed to build policy: {}", e)))?;
+        // Check DNS result
+        let inet_address = inet_address_result
+            .map_err(|e| {
+                Error::Internal(format!("Failed to resolve hostname '{}': {}", hostname, e))
+            })?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert InetAddress: {}", e)))?;
 
-    let permissive_policy_obj = permissive_policy
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to get policy object: {}", e)))?;
+        // Get the IP address string
+        let host_address = env
+            .call_method(
+                &inet_address,
+                jni_str!("getHostAddress"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .map_err(|e| Error::Internal(format!("Failed to get host address: {}", e)))?
+            .l()
+            .map_err(|e| Error::Internal(format!("Failed to convert host address: {}", e)))?;
 
-    env.call_static_method(
-        &strict_mode_class,
-        "setThreadPolicy",
-        "(Landroid/os/StrictMode$ThreadPolicy;)V",
-        &[(&permissive_policy_obj).into()],
-    )
-    .map_err(|e| Error::Internal(format!("Failed to set thread policy: {}", e)))?;
-
-    // Call Inet4Address.getByName(hostname) to force IPv4
-    let hostname_jstring = env
-        .new_string(hostname)
-        .map_err(|e| Error::Internal(format!("Failed to create hostname string: {}", e)))?;
-
-    let inet4_address_class = env
-        .find_class("java/net/Inet4Address")
-        .map_err(|e| Error::Internal(format!("Failed to find Inet4Address class: {}", e)))?;
-
-    let inet_address_result = env.call_static_method(
-        &inet4_address_class,
-        "getByName",
-        "(Ljava/lang/String;)Ljava/net/InetAddress;",
-        &[(&hostname_jstring).into()],
-    );
-
-    // Restore old policy
-    let old_policy_obj = old_policy
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to get old policy object: {}", e)))?;
-
-    env.call_static_method(
-        &strict_mode_class,
-        "setThreadPolicy",
-        "(Landroid/os/StrictMode$ThreadPolicy;)V",
-        &[(&old_policy_obj).into()],
-    )
-    .map_err(|e| Error::Internal(format!("Failed to restore thread policy: {}", e)))?;
-
-    // Check DNS result
-    let inet_address = inet_address_result
-        .map_err(|e| Error::Internal(format!("Failed to resolve hostname '{}': {}", hostname, e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert InetAddress: {}", e)))?;
-
-    // Get the IP address string
-    let host_address = env
-        .call_method(&inet_address, "getHostAddress", "()Ljava/lang/String;", &[])
-        .map_err(|e| Error::Internal(format!("Failed to get host address: {}", e)))?
-        .l()
-        .map_err(|e| Error::Internal(format!("Failed to convert host address: {}", e)))?;
-
-    let ip_string: String = env
-        .get_string(&host_address.into())
-        .map_err(|e| Error::Internal(format!("Failed to get IP string: {}", e)))?
-        .into();
-
-    Ok(ip_string)
+        string_value(env, host_address)
+            .map_err(|e| Error::Internal(format!("Failed to get IP string: {}", e)))
+    })
 }
 
 /// Android backend using Cronet for HTTP requests
 #[derive(Clone)]
 pub struct AndroidBackend {
     pub(crate) jvm: &'static JavaVM,
-    cronet_engine: Arc<GlobalRef>,
+    cronet_engine: Arc<Global<JObject<'static>>>,
     cookie_storage: Option<Arc<crate::backend::CookieJar>>,
     config: BackendConfig,
 }

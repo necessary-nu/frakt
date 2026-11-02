@@ -15,9 +15,10 @@ use crate::backend::types::{BodyAccounting, ProgressCallback};
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
-use jni::JNIEnv;
-use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JString, JValue};
+use jni::errors::LogErrorAndDefault;
+use jni::objects::{Global, JByteBuffer, JClass, JObject, JString, JValue};
 use jni::sys::{jint, jlong};
+use jni::{Env, EnvUnowned, NativeMethod, jni_sig, jni_sig_jstr, jni_str};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -68,8 +69,8 @@ impl Inner {
 /// State shared by one request's callbacks and its Rust-side owner.
 pub(crate) struct RequestShared {
     pub inner: Mutex<Inner>,
-    pub url_request: OnceLock<GlobalRef>,
-    pub read_buffer: OnceLock<GlobalRef>,
+    pub url_request: OnceLock<Global<JObject<'static>>>,
+    pub read_buffer: OnceLock<Global<JObject<'static>>>,
     pub upload_progress: Option<ProgressCallback>,
 }
 
@@ -107,7 +108,7 @@ impl RequestShared {
 
     /// Ask Cronet for the next chunk. The caller must have set
     /// `read_outstanding` while holding the lock.
-    pub fn issue_read(&self, env: &mut JNIEnv) {
+    pub fn issue_read(&self, env: &mut Env) {
         let (Some(request), Some(buffer)) = (self.url_request.get(), self.read_buffer.get()) else {
             self.finish(Err(Error::Internal(
                 "Cronet request is not started".to_string(),
@@ -120,11 +121,11 @@ impl RequestShared {
     }
 }
 
-fn call_read(env: &mut JNIEnv, request: &JObject, buffer: &JObject) -> Result<()> {
+fn call_read(env: &mut Env, request: &JObject, buffer: &JObject) -> Result<()> {
     env.call_method(
         request,
-        "read",
-        "(Ljava/nio/ByteBuffer;)V",
+        jni_str!("read"),
+        jni_sig!("(Ljava/nio/ByteBuffer;)V"),
         &[JValue::Object(buffer)],
     )
     .map(|_| ())
@@ -133,13 +134,18 @@ fn call_read(env: &mut JNIEnv, request: &JObject, buffer: &JObject) -> Result<()
 
 /// Turn a failed JNI call into an error, clearing any pending Java exception
 /// so later JNI calls on this thread do not abort.
-pub(crate) fn java_error(env: &mut JNIEnv, what: &str, error: jni::errors::Error) -> Error {
+pub(crate) fn java_error(env: &mut Env, what: &str, error: jni::errors::Error) -> Error {
     let mut message = format!("{} failed: {}", what, error);
-    if env.exception_check().unwrap_or(false) {
-        if let Ok(exception) = env.exception_occurred() {
-            let _ = env.exception_clear();
+    if env.exception_check() {
+        if let Some(exception) = env.exception_occurred() {
+            env.exception_clear();
             if let Some(text) = env
-                .call_method(&exception, "toString", "()Ljava/lang/String;", &[])
+                .call_method(
+                    &exception,
+                    jni_str!("toString"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )
                 .and_then(|v| v.l())
                 .ok()
                 .and_then(|s| java_string(env, &s))
@@ -147,17 +153,16 @@ pub(crate) fn java_error(env: &mut JNIEnv, what: &str, error: jni::errors::Error
                 message = format!("{}: {}", what, text);
             }
         }
-        let _ = env.exception_clear();
+        env.exception_clear();
     }
     Error::Internal(message)
 }
 
-pub(crate) fn java_string(env: &mut JNIEnv, object: &JObject) -> Option<String> {
+pub(crate) fn java_string(env: &mut Env, object: &JObject) -> Option<String> {
     if object.is_null() {
         return None;
     }
-    let string = JString::from(env.new_local_ref(object).ok()?);
-    env.get_string(&string).ok().map(Into::into)
+    env.as_cast::<JString>(object).ok()?.try_to_string(env).ok()
 }
 
 static HANDLERS: LazyLock<Mutex<HashMap<jlong, Arc<RequestShared>>>> =
@@ -181,28 +186,48 @@ fn lookup(id: jlong) -> Option<Arc<RequestShared>> {
 /// All header values of a `UrlResponseInfo`, in order, repeated names
 /// appended. Values that are not valid header values are skipped rather than
 /// failing the request.
-fn extract_headers(env: &mut JNIEnv, info: &JObject) -> Result<HeaderMap> {
+fn extract_headers(env: &mut Env, info: &JObject) -> Result<HeaderMap> {
     let list = env
-        .call_method(info, "getAllHeadersAsList", "()Ljava/util/List;", &[])
+        .call_method(
+            info,
+            jni_str!("getAllHeadersAsList"),
+            jni_sig!("()Ljava/util/List;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .map_err(|e| java_error(env, "getAllHeadersAsList", e))?;
     let size = env
-        .call_method(&list, "size", "()I", &[])
+        .call_method(&list, jni_str!("size"), jni_sig!("()I"), &[])
         .and_then(|v| v.i())
         .map_err(|e| java_error(env, "List.size", e))?;
 
     let mut headers = HeaderMap::new();
     for i in 0..size {
         let entry = env
-            .call_method(&list, "get", "(I)Ljava/lang/Object;", &[JValue::Int(i)])
+            .call_method(
+                &list,
+                jni_str!("get"),
+                jni_sig!("(I)Ljava/lang/Object;"),
+                &[JValue::Int(i)],
+            )
             .and_then(|v| v.l())
             .map_err(|e| java_error(env, "List.get", e))?;
         let key = env
-            .call_method(&entry, "getKey", "()Ljava/lang/Object;", &[])
+            .call_method(
+                &entry,
+                jni_str!("getKey"),
+                jni_sig!("()Ljava/lang/Object;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(|e| java_error(env, "Entry.getKey", e))?;
         let value = env
-            .call_method(&entry, "getValue", "()Ljava/lang/Object;", &[])
+            .call_method(
+                &entry,
+                jni_str!("getValue"),
+                jni_sig!("()Ljava/lang/Object;"),
+                &[],
+            )
             .and_then(|v| v.l())
             .map_err(|e| java_error(env, "Entry.getValue", e))?;
         if let (Some(key), Some(value)) = (java_string(env, &key), java_string(env, &value)) {
@@ -213,9 +238,9 @@ fn extract_headers(env: &mut JNIEnv, info: &JObject) -> Result<HeaderMap> {
                 headers.append(name, value);
             }
         }
-        let _ = env.delete_local_ref(entry);
-        let _ = env.delete_local_ref(key);
-        let _ = env.delete_local_ref(value);
+        env.delete_local_ref(entry);
+        env.delete_local_ref(key);
+        env.delete_local_ref(value);
     }
     Ok(headers)
 }
@@ -233,7 +258,7 @@ fn extract_headers(env: &mut JNIEnv, info: &JObject) -> Result<HeaderMap> {
 /// framing; chunk headers and HTTP/2 or QUIC frames would be counted too,
 /// so no wire count is kept for those.
 fn body_accounting(
-    env: &mut JNIEnv,
+    env: &mut Env,
     info: &JObject,
     headers: &HeaderMap,
     received: Option<i64>,
@@ -262,12 +287,17 @@ fn body_accounting(
                 .any(|w| w == b"chunked")
         });
     let protocol = env
-        .call_method(info, "getNegotiatedProtocol", "()Ljava/lang/String;", &[])
+        .call_method(
+            info,
+            jni_str!("getNegotiatedProtocol"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .ok()
         .and_then(|protocol| java_string(env, &protocol))
         .unwrap_or_default();
-    let _ = env.exception_clear();
+    env.exception_clear();
     // Plain-text HTTP/1.x reports "unknown"; TLS reports the ALPN name.
     let http1 = matches!(protocol.as_str(), "unknown" | "" | "http/1.1" | "http/1.0");
     let baseline = received.filter(|_| http1 && !chunked);
@@ -277,30 +307,35 @@ fn body_accounting(
     (accounting, baseline)
 }
 
-fn received_byte_count(env: &mut JNIEnv, info: &JObject) -> Option<i64> {
+fn received_byte_count(env: &mut Env, info: &JObject) -> Option<i64> {
     let count = env
-        .call_method(info, "getReceivedByteCount", "()J", &[])
+        .call_method(info, jni_str!("getReceivedByteCount"), jni_sig!("()J"), &[])
         .and_then(|v| v.j())
         .ok();
-    let _ = env.exception_clear();
+    env.exception_clear();
     count
 }
 
-fn extract_head(env: &mut JNIEnv, info: &JObject) -> Result<ResponseHead> {
+fn extract_head(env: &mut Env, info: &JObject) -> Result<ResponseHead> {
     let code = env
-        .call_method(info, "getHttpStatusCode", "()I", &[])
+        .call_method(info, jni_str!("getHttpStatusCode"), jni_sig!("()I"), &[])
         .and_then(|v| v.i())
         .map_err(|e| java_error(env, "getHttpStatusCode", e))?;
     let status = StatusCode::from_u16(code as u16)
         .map_err(|_| Error::Internal(format!("Invalid HTTP status {}", code)))?;
     let headers = extract_headers(env, info)?;
     let url = env
-        .call_method(info, "getUrl", "()Ljava/lang/String;", &[])
+        .call_method(
+            info,
+            jni_str!("getUrl"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .ok()
         .and_then(|url| java_string(env, &url))
         .and_then(|url| url::Url::parse(&url).ok());
-    let _ = env.exception_clear();
+    env.exception_clear();
     Ok(ResponseHead {
         status,
         headers,
@@ -309,14 +344,19 @@ fn extract_head(env: &mut JNIEnv, info: &JObject) -> Result<ResponseHead> {
 }
 
 /// Map a `CronetException` to an error.
-fn cronet_error(env: &mut JNIEnv, exception: &JObject) -> Error {
+fn cronet_error(env: &mut Env, exception: &JObject) -> Error {
     let message = env
-        .call_method(exception, "getMessage", "()Ljava/lang/String;", &[])
+        .call_method(
+            exception,
+            jni_str!("getMessage"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )
         .and_then(|v| v.l())
         .ok()
         .and_then(|m| java_string(env, &m))
         .unwrap_or_else(|| "Cronet request failed".to_string());
-    let _ = env.exception_clear();
+    env.exception_clear();
 
     let is_network_exception = match network_exception_class(env) {
         Ok(class) => env.is_instance_of(exception, class).unwrap_or(false),
@@ -327,10 +367,15 @@ fn cronet_error(env: &mut JNIEnv, exception: &JObject) -> Error {
     }
 
     let internal = env
-        .call_method(exception, "getCronetInternalErrorCode", "()I", &[])
+        .call_method(
+            exception,
+            jni_str!("getCronetInternalErrorCode"),
+            jni_sig!("()I"),
+            &[],
+        )
         .and_then(|v| v.i())
         .unwrap_or(0);
-    let _ = env.exception_clear();
+    env.exception_clear();
 
     classify_net_error(internal, message)
 }
@@ -361,9 +406,9 @@ pub(crate) fn classify_net_error(internal: i32, message: String) -> Error {
     }
 }
 
-static NETWORK_EXCEPTION_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+static NETWORK_EXCEPTION_CLASS: OnceLock<Global<JClass<'static>>> = OnceLock::new();
 
-fn network_exception_class(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+fn network_exception_class(env: &mut Env) -> Result<&'static Global<JClass<'static>>> {
     if let Some(class) = NETWORK_EXCEPTION_CLASS.get() {
         return Ok(class);
     }
@@ -374,142 +419,166 @@ fn network_exception_class(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
     Ok(NETWORK_EXCEPTION_CLASS.get_or_init(|| class))
 }
 
-extern "system" fn native_on_redirect_received(
-    mut env: JNIEnv,
-    _this: JObject,
-    handler_id: jlong,
-    request: JObject,
-    info: JObject,
-) {
-    let Some(shared) = lookup(handler_id) else {
-        return;
-    };
-    if let Ok(headers) = extract_headers(&mut env, &info) {
-        shared.update(|inner| {
-            inner.redirect_headers.push(headers);
-            inner.activity += 1;
-        });
-    }
-    if let Err(error) = env.call_method(&request, "followRedirect", "()V", &[]) {
-        let error = java_error(&mut env, "UrlRequest.followRedirect", error);
-        shared.finish(Err(error));
-    }
+/// Run a native callback's body with its JNI environment. The bodies handle
+/// their own errors, and a panic aborts, as from any `extern "system"`
+/// function.
+fn native<'local>(mut env: EnvUnowned<'local>, f: impl FnOnce(&mut Env<'local>)) {
+    env.with_env_no_catch(|env| {
+        f(env);
+        Ok::<_, jni::errors::Error>(())
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
-extern "system" fn native_on_response_started(
-    mut env: JNIEnv,
-    _this: JObject,
+extern "system" fn native_on_redirect_received<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handler_id: jlong,
-    _request: JObject,
-    info: JObject,
+    request: JObject<'local>,
+    info: JObject<'local>,
 ) {
-    let Some(shared) = lookup(handler_id) else {
-        return;
-    };
-    let received = received_byte_count(&mut env, &info);
-    match extract_head(&mut env, &info) {
-        Ok(head) => {
-            let (accounting, baseline) = body_accounting(&mut env, &info, &head.headers, received);
-            let read = shared.update(|inner| {
-                inner.accounting = Some(accounting);
-                inner.wire_baseline = baseline;
-                inner.head = Some(head);
+    native(env, |env| {
+        let Some(shared) = lookup(handler_id) else {
+            return;
+        };
+        if let Ok(headers) = extract_headers(env, &info) {
+            shared.update(|inner| {
+                inner.redirect_headers.push(headers);
                 inner.activity += 1;
-                let read = inner.finished.is_none() && !inner.read_outstanding;
-                inner.read_outstanding |= read;
-                read
             });
-            if read {
-                shared.issue_read(&mut env);
-            }
         }
-        Err(error) => shared.finish(Err(error)),
-    }
+        if let Err(error) =
+            env.call_method(&request, jni_str!("followRedirect"), jni_sig!("()V"), &[])
+        {
+            let error = java_error(env, "UrlRequest.followRedirect", error);
+            shared.finish(Err(error));
+        }
+    })
 }
 
-extern "system" fn native_on_read_completed(
-    mut env: JNIEnv,
-    _this: JObject,
+extern "system" fn native_on_response_started<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handler_id: jlong,
-    _request: JObject,
-    info: JObject,
-    buffer: JObject,
+    _request: JObject<'local>,
+    info: JObject<'local>,
+) {
+    native(env, |env| {
+        let Some(shared) = lookup(handler_id) else {
+            return;
+        };
+        let received = received_byte_count(env, &info);
+        match extract_head(env, &info) {
+            Ok(head) => {
+                let (accounting, baseline) = body_accounting(env, &info, &head.headers, received);
+                let read = shared.update(|inner| {
+                    inner.accounting = Some(accounting);
+                    inner.wire_baseline = baseline;
+                    inner.head = Some(head);
+                    inner.activity += 1;
+                    let read = inner.finished.is_none() && !inner.read_outstanding;
+                    inner.read_outstanding |= read;
+                    read
+                });
+                if read {
+                    shared.issue_read(env);
+                }
+            }
+            Err(error) => shared.finish(Err(error)),
+        }
+    })
+}
+
+extern "system" fn native_on_read_completed<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handler_id: jlong,
+    _request: JObject<'local>,
+    info: JObject<'local>,
+    buffer: JByteBuffer<'local>,
     length: jint,
 ) {
-    let Some(shared) = lookup(handler_id) else {
-        return;
-    };
-    let received = received_byte_count(&mut env, &info);
-    let buffer = JByteBuffer::from(buffer);
-    let chunk = match env.get_direct_buffer_address(&buffer) {
-        Ok(address) if length > 0 => {
-            // SAFETY: Cronet wrote `length` bytes from the start of this
-            // direct buffer, and no read into it is issued until the copy is
-            // queued below.
-            Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(address, length as usize) })
-        }
-        Ok(_) => Bytes::new(),
-        Err(error) => {
-            let error = java_error(&mut env, "GetDirectBufferAddress", error);
-            shared.finish(Err(error));
+    native(env, |env| {
+        let Some(shared) = lookup(handler_id) else {
             return;
+        };
+        let received = received_byte_count(env, &info);
+        let chunk = match env.get_direct_buffer_address(&buffer) {
+            Ok(address) if length > 0 => {
+                // SAFETY: Cronet wrote `length` bytes from the start of this
+                // direct buffer, and no read into it is issued until the copy
+                // is queued below.
+                Bytes::copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(address, length as usize)
+                })
+            }
+            Ok(_) => Bytes::new(),
+            Err(error) => {
+                let error = java_error(env, "GetDirectBufferAddress", error);
+                shared.finish(Err(error));
+                return;
+            }
+        };
+        let read = shared.update(|inner| {
+            inner.activity += 1;
+            inner.record_received(received);
+            if !chunk.is_empty() {
+                inner.chunks.push_back(chunk);
+            }
+            let read = inner.finished.is_none() && inner.chunks.len() < MAX_QUEUED_CHUNKS;
+            inner.read_outstanding = read;
+            read
+        });
+        if read {
+            shared.issue_read(env);
         }
-    };
-    let read = shared.update(|inner| {
-        inner.activity += 1;
-        inner.record_received(received);
-        if !chunk.is_empty() {
-            inner.chunks.push_back(chunk);
+    })
+}
+
+extern "system" fn native_on_succeeded<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    handler_id: jlong,
+    _request: JObject<'local>,
+    info: JObject<'local>,
+) {
+    native(env, |env| {
+        if let Some(shared) = lookup(handler_id) {
+            let received = received_byte_count(env, &info);
+            // The count must be final before the body can end.
+            shared.update(|inner| inner.record_received(received));
+            shared.finish(Ok(()));
         }
-        let read = inner.finished.is_none() && inner.chunks.len() < MAX_QUEUED_CHUNKS;
-        inner.read_outstanding = read;
-        read
-    });
-    if read {
-        shared.issue_read(&mut env);
-    }
+        unregister(handler_id);
+    })
 }
 
-extern "system" fn native_on_succeeded(
-    mut env: JNIEnv,
-    _this: JObject,
+extern "system" fn native_on_failed<'local>(
+    env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handler_id: jlong,
-    _request: JObject,
-    info: JObject,
+    _request: JObject<'local>,
+    info: JObject<'local>,
+    exception: JObject<'local>,
 ) {
-    if let Some(shared) = lookup(handler_id) {
-        let received = received_byte_count(&mut env, &info);
-        // The count must be final before the body can end.
-        shared.update(|inner| inner.record_received(received));
-        shared.finish(Ok(()));
-    }
-    unregister(handler_id);
+    native(env, |env| {
+        if let Some(shared) = lookup(handler_id) {
+            let received = received_byte_count(env, &info);
+            let error = cronet_error(env, &exception);
+            shared.update(|inner| inner.record_received(received));
+            tracing::debug!("Cronet request {} failed: {}", handler_id, error);
+            shared.finish(Err(error));
+        }
+        unregister(handler_id);
+    })
 }
 
-extern "system" fn native_on_failed(
-    mut env: JNIEnv,
-    _this: JObject,
+extern "system" fn native_on_canceled<'local>(
+    _env: EnvUnowned<'local>,
+    _this: JObject<'local>,
     handler_id: jlong,
-    _request: JObject,
-    info: JObject,
-    exception: JObject,
-) {
-    if let Some(shared) = lookup(handler_id) {
-        let received = received_byte_count(&mut env, &info);
-        let error = cronet_error(&mut env, &exception);
-        shared.update(|inner| inner.record_received(received));
-        tracing::debug!("Cronet request {} failed: {}", handler_id, error);
-        shared.finish(Err(error));
-    }
-    unregister(handler_id);
-}
-
-extern "system" fn native_on_canceled(
-    _env: JNIEnv,
-    _this: JObject,
-    handler_id: jlong,
-    _request: JObject,
-    _info: JObject,
+    _request: JObject<'local>,
+    _info: JObject<'local>,
 ) {
     if let Some(shared) = lookup(handler_id) {
         shared.finish(Err(Error::Cancelled));
@@ -517,9 +586,9 @@ extern "system" fn native_on_canceled(
     unregister(handler_id);
 }
 
-extern "system" fn native_on_upload_progress(
-    _env: JNIEnv,
-    _class: JClass,
+extern "system" fn native_on_upload_progress<'local>(
+    _env: EnvUnowned<'local>,
+    _class: JClass<'local>,
     handler_id: jlong,
     bytes_uploaded: jlong,
     total_bytes: jlong,
@@ -539,13 +608,13 @@ extern "system" fn native_on_upload_progress(
 const FRAKT_DEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/classes.dex"));
 
 static DEX_INIT: Mutex<()> = Mutex::new(());
-static DEX_CLASS_LOADER: OnceLock<GlobalRef> = OnceLock::new();
-static CALLBACK_CLASS: OnceLock<GlobalRef> = OnceLock::new();
-static UPLOAD_PROVIDER_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+static DEX_CLASS_LOADER: OnceLock<Global<JObject<'static>>> = OnceLock::new();
+static CALLBACK_CLASS: OnceLock<Global<JClass<'static>>> = OnceLock::new();
+static UPLOAD_PROVIDER_CLASS: OnceLock<Global<JClass<'static>>> = OnceLock::new();
 
 /// The class loader for our embedded DEX. Its parent is the application's
 /// class loader, so the DEX classes see Cronet whichever thread loads them.
-fn get_dex_classloader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
+fn get_dex_classloader(env: &mut Env) -> Result<&'static Global<JObject<'static>>> {
     if let Some(loader) = DEX_CLASS_LOADER.get() {
         return Ok(loader);
     }
@@ -562,8 +631,8 @@ fn get_dex_classloader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
     let parent = super::app_class_loader(env)?;
     let loader = env
         .new_object(
-            "dalvik/system/InMemoryDexClassLoader",
-            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+            jni_str!("dalvik/system/InMemoryDexClassLoader"),
+            jni_sig!("(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"),
             &[JValue::Object(&buffer), JValue::Object(parent.as_obj())],
         )
         .map_err(|e| java_error(env, "InMemoryDexClassLoader", e))?;
@@ -575,17 +644,17 @@ fn get_dex_classloader(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
 
 /// Load a class from our embedded DEX by its binary name, e.g.
 /// `se.brendan.frakt.RustUrlRequestCallback`.
-fn load_class_from_dex<'a>(env: &mut JNIEnv<'a>, class_name: &str) -> Result<JClass<'a>> {
+fn load_class_from_dex<'a>(env: &mut Env<'a>, class_name: &str) -> Result<JClass<'a>> {
     let loader = get_dex_classloader(env)?;
     super::load_class_with(env, loader, class_name)
 }
 
 fn dex_class_with_natives(
-    env: &mut JNIEnv,
-    cell: &'static OnceLock<GlobalRef>,
+    env: &mut Env,
+    cell: &'static OnceLock<Global<JClass<'static>>>,
     class_name: &str,
-    natives: &[jni::NativeMethod],
-) -> Result<&'static GlobalRef> {
+    natives: &[NativeMethod],
+) -> Result<&'static Global<JClass<'static>>> {
     if let Some(class) = cell.get() {
         return Ok(class);
     }
@@ -596,7 +665,9 @@ fn dex_class_with_natives(
         return Ok(class);
     }
     let class = load_class_from_dex(env, class_name)?;
-    env.register_native_methods(&class, natives)
+    // SAFETY: each native's function takes the arguments its signature
+    // declares.
+    unsafe { env.register_native_methods(&class, natives) }
         .map_err(|e| java_error(env, "RegisterNatives", e))?;
     let class = env
         .new_global_ref(class)
@@ -604,41 +675,55 @@ fn dex_class_with_natives(
     Ok(cell.get_or_init(|| class))
 }
 
-fn callback_class(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
-    let request = "Lorg/chromium/net/UrlRequest;";
-    let info = "Lorg/chromium/net/UrlResponseInfo;";
-    let natives = [
-        jni::NativeMethod {
-            name: "nativeOnRedirectReceived".into(),
-            sig: format!("(J{}{})V", request, info).into(),
-            fn_ptr: native_on_redirect_received as *mut std::ffi::c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeOnResponseStarted".into(),
-            sig: format!("(J{}{})V", request, info).into(),
-            fn_ptr: native_on_response_started as *mut std::ffi::c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeOnReadCompleted".into(),
-            sig: format!("(J{}{}Ljava/nio/ByteBuffer;I)V", request, info).into(),
-            fn_ptr: native_on_read_completed as *mut std::ffi::c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeOnSucceeded".into(),
-            sig: format!("(J{}{})V", request, info).into(),
-            fn_ptr: native_on_succeeded as *mut std::ffi::c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeOnFailed".into(),
-            sig: format!("(J{}{}Lorg/chromium/net/CronetException;)V", request, info).into(),
-            fn_ptr: native_on_failed as *mut std::ffi::c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeOnCanceled".into(),
-            sig: format!("(J{}{})V", request, info).into(),
-            fn_ptr: native_on_canceled as *mut std::ffi::c_void,
-        },
-    ];
+fn callback_class(env: &mut Env) -> Result<&'static Global<JClass<'static>>> {
+    // SAFETY: each function takes the arguments of its signature, after the
+    // env and `this`.
+    let natives = unsafe {
+        [
+            NativeMethod::from_raw_parts(
+                jni_str!("nativeOnRedirectReceived"),
+                jni_sig_jstr!(
+                    "(JLorg/chromium/net/UrlRequest;Lorg/chromium/net/UrlResponseInfo;)V"
+                ),
+                native_on_redirect_received as *mut std::ffi::c_void,
+            ),
+            NativeMethod::from_raw_parts(
+                jni_str!("nativeOnResponseStarted"),
+                jni_sig_jstr!(
+                    "(JLorg/chromium/net/UrlRequest;Lorg/chromium/net/UrlResponseInfo;)V"
+                ),
+                native_on_response_started as *mut std::ffi::c_void,
+            ),
+            NativeMethod::from_raw_parts(
+                jni_str!("nativeOnReadCompleted"),
+                jni_sig_jstr!(
+                    "(JLorg/chromium/net/UrlRequest;Lorg/chromium/net/UrlResponseInfo;Ljava/nio/ByteBuffer;I)V"
+                ),
+                native_on_read_completed as *mut std::ffi::c_void,
+            ),
+            NativeMethod::from_raw_parts(
+                jni_str!("nativeOnSucceeded"),
+                jni_sig_jstr!(
+                    "(JLorg/chromium/net/UrlRequest;Lorg/chromium/net/UrlResponseInfo;)V"
+                ),
+                native_on_succeeded as *mut std::ffi::c_void,
+            ),
+            NativeMethod::from_raw_parts(
+                jni_str!("nativeOnFailed"),
+                jni_sig_jstr!(
+                    "(JLorg/chromium/net/UrlRequest;Lorg/chromium/net/UrlResponseInfo;Lorg/chromium/net/CronetException;)V"
+                ),
+                native_on_failed as *mut std::ffi::c_void,
+            ),
+            NativeMethod::from_raw_parts(
+                jni_str!("nativeOnCanceled"),
+                jni_sig_jstr!(
+                    "(JLorg/chromium/net/UrlRequest;Lorg/chromium/net/UrlResponseInfo;)V"
+                ),
+                native_on_canceled as *mut std::ffi::c_void,
+            ),
+        ]
+    };
     dex_class_with_natives(
         env,
         &CALLBACK_CLASS,
@@ -648,11 +733,15 @@ fn callback_class(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
 }
 
 /// The `UploadDataProvider` that reports progress for a handler id.
-pub(crate) fn upload_provider_class(env: &mut JNIEnv) -> Result<&'static GlobalRef> {
-    let natives = [jni::NativeMethod {
-        name: "nativeOnUploadProgress".into(),
-        sig: "(JJJ)V".into(),
-        fn_ptr: native_on_upload_progress as *mut std::ffi::c_void,
+pub(crate) fn upload_provider_class(env: &mut Env) -> Result<&'static Global<JClass<'static>>> {
+    // SAFETY: the function takes the arguments of the signature, after the
+    // env and the class.
+    let natives = [unsafe {
+        NativeMethod::from_raw_parts(
+            jni_str!("nativeOnUploadProgress"),
+            jni_sig_jstr!("(JJJ)V"),
+            native_on_upload_progress as *mut std::ffi::c_void,
+        )
     }];
     dex_class_with_natives(
         env,
@@ -664,15 +753,11 @@ pub(crate) fn upload_provider_class(env: &mut JNIEnv) -> Result<&'static GlobalR
 
 /// A `RustUrlRequestCallback` that forwards to the handler `handler_id`.
 pub(crate) fn create_callback_instance<'a>(
-    env: &mut JNIEnv<'a>,
+    env: &mut Env<'a>,
     handler_id: jlong,
 ) -> Result<JObject<'a>> {
     let class = callback_class(env)?;
-    let class = JClass::from(
-        env.new_local_ref(class.as_obj())
-            .map_err(|e| java_error(env, "NewLocalRef", e))?,
-    );
-    env.new_object(&class, "(J)V", &[JValue::Long(handler_id)])
+    env.new_object(class, jni_sig!("(J)V"), &[JValue::Long(handler_id)])
         .map_err(|e| java_error(env, "RustUrlRequestCallback.<init>", e))
 }
 

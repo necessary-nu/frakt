@@ -269,6 +269,84 @@ fn error_chain_message(error: &(dyn std::error::Error + 'static)) -> String {
     message
 }
 
+/// The TLS configuration: the process's default rustls crypto provider or
+/// else ring, the webpki (Mozilla) roots, and HTTP/1.1 by ALPN, as no HTTP/2
+/// is built. reqwest has no feature for ring with the webpki roots.
+fn tls_config(accept_invalid_certs: bool) -> Result<rustls::ClientConfig> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .map_err(|e| Error::Internal(format!("Invalid TLS versions: {}", e)))?;
+    let mut config = if accept_invalid_certs {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+    } else {
+        builder.with_root_certificates(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+    }
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Accepts every server certificate, for `ignore_certificate_errors`.
+#[derive(Debug)]
+struct AcceptAnyCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        use rustls::SignatureScheme::*;
+        vec![
+            RSA_PKCS1_SHA1,
+            ECDSA_SHA1_Legacy,
+            RSA_PKCS1_SHA256,
+            ECDSA_NISTP256_SHA256,
+            RSA_PKCS1_SHA384,
+            ECDSA_NISTP384_SHA384,
+            RSA_PKCS1_SHA512,
+            ECDSA_NISTP521_SHA512,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            ED25519,
+            ED448,
+        ]
+    }
+}
+
 /// Reqwest backend for cross-platform HTTP
 #[derive(Clone)]
 pub struct ReqwestBackend {
@@ -300,12 +378,9 @@ impl ReqwestBackend {
             builder = builder.user_agent(user_agent);
         }
 
-        // Apply certificate validation settings
-        if let Some(ignore_certs) = config.ignore_certificate_errors {
-            if ignore_certs {
-                builder = builder.danger_accept_invalid_certs(true);
-            }
-        }
+        builder = builder.tls_backend_preconfigured(tls_config(
+            config.ignore_certificate_errors.unwrap_or(false),
+        )?);
 
         // Apply default headers
         if let Some(default_headers) = config.default_headers.clone() {
