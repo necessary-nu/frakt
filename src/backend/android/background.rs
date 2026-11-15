@@ -1,6 +1,6 @@
 //! Background downloads on Android, run by WorkManager.
 //!
-//! The worker is `se.brendan.frakt.background.FraktDownloadWorker`, in the
+//! The worker is `nu.necessary.frakt.background.FraktDownloadWorker`, in the
 //! `android/frakt-background` library module, which the host app includes
 //! so the worker is in the app's own dex: WorkManager recreates it by class
 //! name, including in a process the system starts only to run it. The
@@ -15,10 +15,11 @@
 //!
 //! # Host integration
 //!
-//! - Include `android/frakt-background` as a Gradle module
-//!   (`include(":frakt-background")` with its `projectDir` pointing there,
-//!   then `implementation(project(":frakt-background"))`), or the AAR it
-//!   builds plus `androidx.work:work-runtime`.
+//! - Depend on `nu.necessary:frakt-background` at this crate's version,
+//!   from the Maven repository `https://pahkat-3.giellalt.org/maven/divvun/`,
+//!   which brings `androidx.work:work-runtime` with it; or include
+//!   `android/frakt-background` as a Gradle module, or as an included build
+//!   that substitutes those coordinates.
 //! - Its manifest adds the INTERNET, ACCESS_NETWORK_STATE,
 //!   FOREGROUND_SERVICE and FOREGROUND_SERVICE_DATA_SYNC permissions and
 //!   declares WorkManager's foreground service with the `dataSync` type.
@@ -54,7 +55,7 @@ use super::callback::{java_error, java_string};
 use crate::background::{BackgroundHandler, BackgroundJob, FinishedDownload, JobState, JobStatus};
 use crate::{Error, Result};
 
-const HELPER: &str = "se.brendan.frakt.background.FraktBackground";
+const HELPER: &str = "nu.necessary.frakt.background.FraktBackground";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A job's status file, as `JobFiles` in frakt-background writes it.

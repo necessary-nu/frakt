@@ -1,4 +1,4 @@
-package se.brendan.frakt.background;
+package nu.necessary.frakt.background;
 
 import java.io.File;
 import java.io.FileInputStream;

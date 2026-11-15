@@ -10,13 +10,13 @@
 # 3. A 404 is reported as a failure that is not resumable, and a cancelled
 #    job is listed while pending, then disappears with its files.
 #
-# Needs ANDROID_HOME and ANDROID_NDK_HOME, cargo-ndk and Gradle. The test
+# Needs ANDROID_HOME, ANDROID_NDK_HOME and cargo-ndk. The test
 # server runs on this machine; the emulator reaches it as 10.0.2.2.
 set -eu
 
 cd "$(dirname "$0")/../.."
 ADB="$ANDROID_HOME/platform-tools/adb"
-PKG=se.brendan.frakt.bgtest
+PKG=nu.necessary.frakt.bgtest
 LEN=33554432
 RATE=2097152
 
@@ -25,7 +25,7 @@ cargo ndk -t arm64-v8a build --release --example android_bg_harness \
 mkdir -p android/bgtest/src/main/jniLibs/arm64-v8a
 cp target/aarch64-linux-android/release/examples/libandroid_bg_harness.so \
     android/bgtest/src/main/jniLibs/arm64-v8a/
-(cd android && gradle --no-daemon -q :bgtest:assembleDebug)
+(cd android && ./gradlew --no-daemon -q :bgtest:assembleDebug)
 cargo build --release --example test_server
 
 "$ADB" install -r android/bgtest/build/outputs/apk/debug/bgtest-debug.apk

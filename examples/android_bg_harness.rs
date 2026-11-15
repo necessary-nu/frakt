@@ -85,7 +85,7 @@ mod harness {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_start<'local>(
+    pub extern "system" fn Java_nu_necessary_frakt_bgtest_Harness_start<'local>(
         env: EnvUnowned<'local>,
         _class: JClass<'local>,
         context: JObject<'local>,
@@ -111,7 +111,7 @@ mod harness {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_enqueue<'local>(
+    pub extern "system" fn Java_nu_necessary_frakt_bgtest_Harness_enqueue<'local>(
         env: EnvUnowned<'local>,
         _class: JClass<'local>,
         job: JString<'local>,
@@ -134,7 +134,7 @@ mod harness {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_cancel<'local>(
+    pub extern "system" fn Java_nu_necessary_frakt_bgtest_Harness_cancel<'local>(
         env: EnvUnowned<'local>,
         _class: JClass<'local>,
         job: JString<'local>,
@@ -152,7 +152,7 @@ mod harness {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_se_brendan_frakt_bgtest_Harness_jobs<'local>(
+    pub extern "system" fn Java_nu_necessary_frakt_bgtest_Harness_jobs<'local>(
         env: EnvUnowned<'local>,
         _class: JClass<'local>,
     ) -> JString<'local> {

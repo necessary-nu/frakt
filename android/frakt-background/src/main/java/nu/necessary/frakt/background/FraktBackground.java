@@ -1,4 +1,4 @@
-package se.brendan.frakt.background;
+package nu.necessary.frakt.background;
 
 import android.content.Context;
 

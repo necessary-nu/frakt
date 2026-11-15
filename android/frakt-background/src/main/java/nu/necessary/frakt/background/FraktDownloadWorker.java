@@ -1,4 +1,4 @@
-package se.brendan.frakt.background;
+package nu.necessary.frakt.background;
 
 import android.app.Notification;
 import android.app.NotificationChannel;

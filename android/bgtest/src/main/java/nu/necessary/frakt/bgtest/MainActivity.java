@@ -1,4 +1,4 @@
-package se.brendan.frakt.bgtest;
+package nu.necessary.frakt.bgtest;
 
 import android.app.Activity;
 import android.content.Intent;
@@ -7,7 +7,7 @@ import android.util.Log;
 
 /**
  * Runs one harness action from the launching intent and finishes:
- * {@code am start -n se.brendan.frakt.bgtest/.MainActivity --es action
+ * {@code am start -n nu.necessary.frakt.bgtest/.MainActivity --es action
  * enqueue --es job ID --es url URL}, or {@code --es action collect},
  * {@code jobs} or {@code cancel}. Results go to logcat under FraktHarness;
  * events go to files/events.jsonl.

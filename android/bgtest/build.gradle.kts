@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "se.brendan.frakt.bgtest"
+    namespace = "nu.necessary.frakt.bgtest"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "se.brendan.frakt.bgtest"
+        applicationId = "nu.necessary.frakt.bgtest"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

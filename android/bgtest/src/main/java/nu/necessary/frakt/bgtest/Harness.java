@@ -1,4 +1,4 @@
-package se.brendan.frakt.bgtest;
+package nu.necessary.frakt.bgtest;
 
 import android.content.Context;
 
