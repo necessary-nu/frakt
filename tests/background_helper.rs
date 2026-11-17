@@ -772,9 +772,14 @@ mod host {
     }
 
     async fn helper_keeps_no_inherited_descriptors() {
-        // Any other program has them.
+        // Any other program has them, along with whatever whoever started
+        // these tests left open for every child: a CI agent hands down
+        // descriptors of its own.
         let inherited = first_line_with_planted_descriptors(Some("descriptors")).await;
-        assert_eq!(inherited, json!([0, 1, 2, PLANTED[0], PLANTED[1]]));
+        let inherited: Vec<i32> = serde_json::from_value(inherited).unwrap();
+        for descriptor in PLANTED {
+            assert!(inherited.contains(&descriptor), "{:?}", inherited);
+        }
 
         let kept = first_line_with_planted_descriptors(None).await;
         assert_eq!(kept, json!({ "event": "descriptors", "open": [0, 1, 2] }));

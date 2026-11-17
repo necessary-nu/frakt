@@ -294,7 +294,8 @@ impl CookieJar {
     /// Remove a cookie from the jar.
     ///
     /// The cookie will no longer be stored or sent with requests. It is
-    /// identified by its name, domain and path.
+    /// identified by its name, domain and path; removing one that is not
+    /// stored does nothing.
     ///
     /// # Arguments
     ///

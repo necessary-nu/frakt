@@ -1398,8 +1398,8 @@ async fn custom_cookie_jar_is_the_active_store(backend: BackendType) {
     // the test: use names of our own and take them out again.
     let preloaded = Cookie::new("frakt-test-pre", "1").domain("127.0.0.1");
     let updated = Cookie::new("frakt-test-upd", "2").domain("127.0.0.1");
-    let _ = jar.remove_cookie(preloaded.clone());
-    let _ = jar.remove_cookie(updated.clone());
+    jar.remove_cookie(preloaded.clone()).unwrap();
+    jar.remove_cookie(updated.clone()).unwrap();
 
     jar.add_cookie(preloaded.clone()).unwrap();
     let client = client_with(backend, |b| b.cookie_jar(jar.clone()));

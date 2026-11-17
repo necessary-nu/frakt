@@ -121,11 +121,12 @@ impl CookieJar {
             cookie.path
         ));
 
-        self.lock()
-            .parse(&expired_cookie, &url)
-            .map_err(|e| Error::Internal(format!("Failed to remove cookie: {}", e)))?;
-
-        Ok(())
+        match self.lock().parse(&expired_cookie, &url) {
+            // The store's answer to an expired cookie that replaces none:
+            // there was nothing to remove.
+            Ok(_) | Err(cookie_store::CookieError::Expired) => Ok(()),
+            Err(e) => Err(Error::Internal(format!("Failed to remove cookie: {}", e))),
+        }
     }
 
     /// A URL the cookie would be accepted from: the store only takes
@@ -391,6 +392,25 @@ mod tests {
 
         jar.remove_cookie(cookie).unwrap();
         assert!(jar.cookie_header(&url("http://example.com/")).is_none());
+    }
+
+    #[test]
+    fn removing_a_cookie_that_is_not_stored_does_nothing() {
+        let jar = CookieJar::new();
+        let kept = Cookie::new("kept", "1").domain("example.com");
+        jar.add_cookie(kept).unwrap();
+
+        for absent in [
+            Cookie::new("absent", "1").domain("example.com"),
+            Cookie::new("kept", "1").domain("example.org"),
+            Cookie::new("kept", "1")
+                .domain("example.com")
+                .path("/other"),
+            Cookie::new("absent", "1"),
+        ] {
+            jar.remove_cookie(absent).unwrap();
+        }
+        assert_eq!(names(&jar), ["kept"]);
     }
 
     #[test]
