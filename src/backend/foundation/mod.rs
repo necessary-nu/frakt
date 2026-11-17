@@ -120,18 +120,34 @@ impl FoundationBackend {
         session_config.setRequestCachePolicy(NSURLRequestCachePolicy::ReloadIgnoringLocalCacheData);
         session_config.setTimeoutIntervalForRequest(NO_TIMEOUT);
 
-        let cookie_storage = config
-            .cookie_jar
-            .as_ref()
-            .and_then(|jar| jar.foundation_storage());
-        if config.use_cookies == Some(true) || cookie_storage.is_some() {
-            if let Some(storage) = cookie_storage {
-                session_config.setHTTPCookieStorage(Some(storage.ns_storage()));
-            }
-        } else {
+        let cookie_jar = if !config.cookies_enabled() {
             session_config.setHTTPShouldSetCookies(false);
             session_config.setHTTPCookieAcceptPolicy(NSHTTPCookieAcceptPolicy::Never);
             session_config.setHTTPCookieStorage(None);
+            None
+        } else if let Some(jar) = &config.cookie_jar {
+            let storage = jar.foundation_storage().ok_or_else(|| {
+                Error::Internal(
+                    "The cookie jar is not backed by NSHTTPCookieStorage, which is the only \
+                     kind the Foundation backend can use"
+                        .to_string(),
+                )
+            })?;
+            session_config.setHTTPCookieStorage(Some(storage.ns_storage()));
+            Some(jar.clone())
+        } else {
+            // The ephemeral configuration's own in-memory storage.
+            session_config.HTTPCookieStorage().map(|storage| {
+                crate::CookieJar::with_foundation_storage(FoundationCookieStorage::from_ns_storage(
+                    storage,
+                ))
+            })
+        };
+        if cookie_jar.is_some() {
+            // The configuration's own policy defaults to
+            // OnlyFromMainDocumentDomain and would override the storage's,
+            // which is the one `CookieJar::set_cookie_accept_policy` sets.
+            session_config.setHTTPCookieAcceptPolicy(NSHTTPCookieAcceptPolicy::Always);
         }
 
         if let Some(proxies) = proxy_dictionary(&config) {
@@ -148,7 +164,7 @@ impl FoundationBackend {
 
         Ok(Self {
             session: Arc::new(Session { session, delegate }),
-            cookie_jar: config.cookie_jar,
+            cookie_jar,
             default_headers: config.default_headers,
             user_agent: config.user_agent,
             read_timeout: config.read_timeout,
@@ -188,7 +204,6 @@ impl FoundationBackend {
             url: head.url.unwrap_or(requested_url),
             body: Box::pin(body),
             accounting,
-            redirect_headers: vec![],
         })
     }
 
@@ -205,6 +220,9 @@ impl FoundationBackend {
         let nsrequest = NSMutableURLRequest::requestWithURL(&nsurl);
         nsrequest.setHTTPMethod(&NSString::from_str(request.method.as_str()));
         nsrequest.setTimeoutInterval(NO_TIMEOUT);
+        // What OnlyFromMainDocumentDomain compares a cookie's origin with,
+        // on every hop of a redirect chain.
+        nsrequest.setMainDocumentURL(Some(&nsurl));
 
         let mut headers = self.default_headers.clone().unwrap_or_default();
         if let Some(user_agent) = &self.user_agent {
@@ -220,16 +238,19 @@ impl FoundationBackend {
             headers.append(name.clone(), value.clone());
         }
 
+        let upload_file = match &request.body {
+            Some(crate::body::Body::File { file, .. }) => Some(upload_file_url(file)?),
+            _ => None,
+        };
         if let Some(body) = &request.body {
             let (content_type, data) = encode_body(body)?;
-            if let Some(content_type) = content_type {
-                if !headers.contains_key(http::header::CONTENT_TYPE) {
-                    headers.insert(
-                        http::header::CONTENT_TYPE,
-                        http::HeaderValue::from_str(&content_type)
-                            .map_err(|_| Error::InvalidHeader)?,
-                    );
-                }
+            if let Some(content_type) = content_type
+                && !headers.contains_key(http::header::CONTENT_TYPE)
+            {
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_str(&content_type).map_err(|_| Error::InvalidHeader)?,
+                );
             }
             if let Some(data) = data {
                 nsrequest.setHTTPBody(Some(&objc2_foundation::NSData::from_vec(data)));
@@ -249,7 +270,16 @@ impl FoundationBackend {
         }
 
         let state = Arc::new(DataTaskState::new(request.progress_callback));
-        let task = self.session.session.dataTaskWithRequest(&nsrequest);
+        let task = match upload_file {
+            // The system reads the file as it sends it, and again if a
+            // redirect or an authentication challenge needs the body twice.
+            Some(file_url) => Retained::into_super(
+                self.session
+                    .session
+                    .uploadTaskWithRequest_fromFile(&nsrequest, &file_url),
+            ),
+            None => self.session.session.dataTaskWithRequest(&nsrequest),
+        };
         self.session
             .delegate
             .register(task.taskIdentifier(), state.clone());
@@ -276,7 +306,7 @@ impl FoundationBackend {
         file_path: std::path::PathBuf,
         session_identifier: Option<String>,
         headers: http::HeaderMap,
-        progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+        progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
         error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
         background::execute_background_download(
@@ -368,12 +398,12 @@ impl Stream for FoundationBody {
                 if matches!(item, None | Some(Err(_))) {
                     self.finished = true;
                 }
-                if item.is_none() && !self.chunked {
-                    if let (Some(accounting), Some(raw)) =
+                if item.is_none()
+                    && !self.chunked
+                    && let (Some(accounting), Some(raw)) =
                         (&self.accounting, self.state.raw_body_bytes())
-                    {
-                        accounting.set_wire_bytes(raw);
-                    }
+                {
+                    accounting.set_wire_bytes(raw);
                 }
                 Poll::Ready(item)
             }
@@ -458,7 +488,36 @@ fn encode_body(body: &crate::body::Body) -> Result<(Option<String>, Option<Vec<u
                 Some(encode_multipart_data(&boundary, parts)?),
             )
         }
+        crate::body::Body::File { content_type, .. } => (Some(content_type.clone()), None),
     })
+}
+
+/// The URL to hand an upload task for `file`. NSURLSession opens the path
+/// itself, so the path must still name the file that was opened and sized
+/// when the body was made; anything else would send other bytes than the
+/// caller chose.
+fn upload_file_url(file: &crate::body::FileBody) -> Result<Retained<NSURL>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let changed = || {
+        Error::Io(format!(
+            "{} was replaced or resized after it was opened for upload",
+            file.path().display()
+        ))
+    };
+    let now = std::fs::metadata(file.path()).map_err(|_| changed())?;
+    let opened = file.metadata()?;
+    if (now.dev(), now.ino(), now.len()) != (opened.dev(), opened.ino(), file.len()) {
+        return Err(changed());
+    }
+
+    let path = file.path().to_str().ok_or_else(|| {
+        Error::Io(format!(
+            "{} is not a UTF-8 path, which NSURL needs",
+            file.path().display()
+        ))
+    })?;
+    Ok(NSURL::fileURLWithPath(&NSString::from_str(path)))
 }
 
 /// `connectionProxyDictionary` for explicitly configured proxies, or `None`

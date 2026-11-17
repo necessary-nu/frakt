@@ -13,7 +13,10 @@ use std::sync::Arc;
 use tokio::time::{Instant, Sleep};
 use url::Url;
 
-/// HTTP response from any backend
+/// HTTP response from any backend.
+///
+/// Its `Debug` output shows the status, URL and headers, with the values of
+/// `Set-Cookie` and other credential-bearing headers left out.
 pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
@@ -26,7 +29,7 @@ impl Debug for Response {
         f.debug_struct("Response")
             .field("status", &self.status)
             .field("url", &self.url)
-            .field("headers", &self.headers)
+            .field("headers", &crate::redact::RedactedHeaders(&self.headers))
             .finish()
     }
 }
@@ -272,12 +275,12 @@ impl ResponseBody {
             return Poll::Ready(None);
         };
 
-        if let Some(deadline) = self.deadline.as_mut() {
-            if deadline.as_mut().poll(cx).is_ready() {
-                // Dropping the backend stream cancels the transfer.
-                self.stream = None;
-                return Poll::Ready(Some(Err(Error::Timeout)));
-            }
+        if let Some(deadline) = self.deadline.as_mut()
+            && deadline.as_mut().poll(cx).is_ready()
+        {
+            // Dropping the backend stream cancels the transfer.
+            self.stream = None;
+            return Poll::Ready(Some(Err(Error::Timeout)));
         }
 
         match stream.as_mut().poll_next(cx) {
@@ -407,7 +410,6 @@ mod tests {
                 url: Url::parse("http://example.invalid/").unwrap(),
                 body: Box::pin(futures_util::stream::iter(chunks)),
                 accounting,
-                redirect_headers: vec![],
             },
             None,
             false,

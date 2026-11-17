@@ -52,8 +52,6 @@ pub struct BackendResponse {
     pub body: BodyStream,
     /// How the body relates to the bytes on the wire
     pub accounting: Arc<BodyAccounting>,
-    /// Headers from redirect responses (for cookie processing)
-    pub redirect_headers: Vec<HeaderMap>,
 }
 
 /// What a backend knows about a body's encoding and size.
@@ -234,3 +232,6 @@ pub struct ProgressInfo {
 
 /// Callback type for progress reporting
 pub type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
+
+/// A progress callback as the builders hold it, before a request shares it
+pub type BoxedProgressCallback = Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;

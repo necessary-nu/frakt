@@ -59,7 +59,7 @@ impl Cookie {
             // Cast the dictionary to NSDictionary and create the cookie
             let cookie_dict: Retained<NSDictionary<NSString, AnyObject>> =
                 objc2::rc::Retained::cast_unchecked(dict);
-            NSHTTPCookie::cookieWithProperties(&*cookie_dict)
+            NSHTTPCookie::cookieWithProperties(&cookie_dict)
                 .ok_or_else(|| Error::Internal("Failed to create NSHTTPCookie".to_string()))
         }
     }
@@ -90,9 +90,19 @@ impl Cookie {
     }
 }
 
+impl Default for FoundationCookieStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FoundationCookieStorage {
     pub(crate) fn ns_storage(&self) -> &NSHTTPCookieStorage {
         &self.storage
+    }
+
+    pub(crate) fn from_ns_storage(storage: Retained<NSHTTPCookieStorage>) -> Self {
+        Self { storage }
     }
 
     /// Create a new cookie storage with shared storage

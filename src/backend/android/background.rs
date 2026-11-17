@@ -455,10 +455,10 @@ struct Waiter {
 
 impl BackgroundHandler for Waiters {
     fn progress(&self, job: &str, downloaded: u64, total: Option<u64>) {
-        if let Some(waiter) = self.pending.lock().unwrap().get(job) {
-            if let Some(progress) = &waiter.progress {
-                progress(downloaded, total);
-            }
+        if let Some(waiter) = self.pending.lock().unwrap().get(job)
+            && let Some(progress) = &waiter.progress
+        {
+            progress(downloaded, total);
         }
     }
 

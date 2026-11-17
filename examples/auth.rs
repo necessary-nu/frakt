@@ -4,7 +4,6 @@
 //! using httpbin's authentication endpoints.
 
 use frakt::{Auth, Client};
-use tokio;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = client
         .get("https://httpbin.org/basic-auth/testuser/testpass")?
-        .auth(basic_auth)
+        .auth(basic_auth)?
         .send()
         .await?;
 
@@ -40,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = client
         .get("https://httpbin.org/bearer")?
-        .auth(bearer_auth)
+        .auth(bearer_auth)?
         .send()
         .await?;
 
@@ -61,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = client
         .get("https://httpbin.org/headers")?
-        .auth(custom_auth)
+        .auth(custom_auth)?
         .send()
         .await?;
 
@@ -99,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Testing Download with Authentication ===");
     let response = client
         .get("https://httpbin.org/basic-auth/download-user/download-pass")?
-        .auth(Auth::basic("download-user", "download-pass"))
+        .auth(Auth::basic("download-user", "download-pass"))?
         .send()
         .await?;
 

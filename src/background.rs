@@ -48,7 +48,7 @@ use crate::backend::android::background as platform;
 use crate::backend::foundation::background as platform;
 
 /// A download to hand to the platform.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackgroundJob {
     /// The caller's name for the job, unique among pending jobs. Events,
     /// [`BackgroundDownloads::cancel`] and resumption use it, across
@@ -62,6 +62,19 @@ pub struct BackgroundJob {
     /// [`FinishedDownload::destination`]. frakt does not move the file
     /// there itself.
     pub destination: Option<PathBuf>,
+}
+
+/// `Authorization`, cookies and other credential-bearing header values are
+/// not shown.
+impl std::fmt::Debug for BackgroundJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundJob")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("headers", &crate::redact::RedactedHeaders(&self.headers))
+            .field("destination", &self.destination)
+            .finish()
+    }
 }
 
 impl BackgroundJob {
@@ -78,7 +91,6 @@ impl BackgroundJob {
 
 /// A finished download, valid for the duration of
 /// [`BackgroundHandler::finished`].
-#[derive(Debug)]
 pub struct FinishedDownload<'a> {
     /// The job's id.
     pub job: &'a str,
@@ -91,6 +103,18 @@ pub struct FinishedDownload<'a> {
     pub status: StatusCode,
     /// The final response's headers.
     pub headers: &'a HeaderMap,
+}
+
+impl std::fmt::Debug for FinishedDownload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinishedDownload")
+            .field("job", &self.job)
+            .field("file", &self.file)
+            .field("destination", &self.destination)
+            .field("status", &self.status)
+            .field("headers", &crate::redact::RedactedHeaders(self.headers))
+            .finish()
+    }
 }
 
 /// Receives the results of background downloads. Methods may be called on

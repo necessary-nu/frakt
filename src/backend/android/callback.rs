@@ -5,6 +5,13 @@
 //! `RegisterNatives` on the class loaded from our embedded DEX, so they are not
 //! exported from the library.
 //!
+//! A handler id names one `UrlRequest`, and a callback whose id is not
+//! registered does nothing. Cronet delivers `onCanceled` from its executor
+//! after `cancel()` has returned, so an id is unregistered before its request
+//! is cancelled: nothing more arrives for a request that was dropped, or that
+//! a redirect's next hop replaced, apart from a callback already running,
+//! which only touches that request's own state.
+//!
 //! Reads are pull-based: Cronet only reads more of the body after
 //! `UrlRequest.read()`, so a read is issued only while fewer than
 //! [`MAX_QUEUED_CHUNKS`] chunks wait for the consumer. Either the callback
@@ -12,6 +19,7 @@
 //! `Inner::read_outstanding` keeps it to one at a time, as Cronet requires.
 
 use crate::backend::types::{BodyAccounting, ProgressCallback};
+use crate::body::FileBody;
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
@@ -25,7 +33,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::Waker;
 
 /// Capacity of the direct buffer each read fills.
-pub(crate) const READ_BUFFER_SIZE: jint = 64 * 1024;
+const READ_BUFFER_SIZE: jint = 64 * 1024;
 
 /// Chunks read ahead of the consumer before reading stops.
 pub(crate) const MAX_QUEUED_CHUNKS: usize = 8;
@@ -36,14 +44,57 @@ pub(crate) struct ResponseHead {
     pub url: Option<url::Url>,
 }
 
+/// A request body that `RustUploadDataProvider` reads by offset, so the same
+/// body can be sent again after a rewind and, by the next request, after a
+/// redirect.
+#[derive(Clone)]
+pub(crate) enum UploadSource {
+    Bytes(Bytes),
+    File(FileBody),
+}
+
+impl UploadSource {
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => bytes.len() as u64,
+            Self::File(file) => file.len(),
+        }
+    }
+
+    /// At most `max` bytes at `offset`; empty at or past the end. Reading a
+    /// file blocks.
+    fn chunk(&self, offset: u64, max: usize) -> std::io::Result<Bytes> {
+        match self {
+            Self::Bytes(bytes) => {
+                let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
+                let end = start + max.min(bytes.len() - start);
+                Ok(bytes.slice(start..end))
+            }
+            Self::File(file) => {
+                let mut chunk = file.read_chunk(offset, max)?;
+                chunk.truncate(max);
+                Ok(chunk)
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Inner {
     pub head: Option<ResponseHead>,
-    pub redirect_headers: Vec<HeaderMap>,
+    /// A redirect response. Cronet then waits to be told to follow it, which
+    /// it never is: the request's owner cancels it and sends the next one.
+    pub redirect: Option<ResponseHead>,
     pub chunks: VecDeque<Bytes>,
     pub read_outstanding: bool,
-    /// Set once Cronet reports success, failure or cancellation.
+    /// Set once Cronet reports success, failure or cancellation, or a call
+    /// into Cronet fails.
     pub finished: Option<Result<()>>,
+    /// Cronet has made its last callback, so there is nothing to cancel.
+    pub terminated: bool,
+    /// Why the upload provider failed a read. Cronet fails the request with
+    /// a callback exception that does not say, so this is reported instead.
+    upload_error: Option<Error>,
     pub waker: Option<Waker>,
     /// Bumped on every sign of progress, so idle timers can tell a quiet
     /// transfer from a slow one.
@@ -56,6 +107,13 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
+    fn finish(&mut self, result: Result<()>) {
+        if self.finished.is_none() {
+            self.finished = Some(result);
+        }
+        self.read_outstanding = false;
+    }
+
     /// Update the wire count from a later `getReceivedByteCount()`.
     fn record_received(&self, received: Option<i64>) {
         if let (Some(accounting), Some(baseline), Some(received)) =
@@ -70,16 +128,20 @@ impl Inner {
 pub(crate) struct RequestShared {
     pub inner: Mutex<Inner>,
     pub url_request: OnceLock<Global<JObject<'static>>>,
-    pub read_buffer: OnceLock<Global<JObject<'static>>>,
-    pub upload_progress: Option<ProgressCallback>,
+    /// Allocated when the response starts: a request that ends at a redirect
+    /// never reads.
+    read_buffer: OnceLock<Global<JObject<'static>>>,
+    upload: Option<UploadSource>,
+    upload_progress: Option<ProgressCallback>,
 }
 
 impl RequestShared {
-    pub fn new(upload_progress: Option<ProgressCallback>) -> Self {
+    pub fn new(upload: Option<UploadSource>, upload_progress: Option<ProgressCallback>) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             url_request: OnceLock::new(),
             read_buffer: OnceLock::new(),
+            upload,
             upload_progress,
         }
     }
@@ -98,12 +160,32 @@ impl RequestShared {
     }
 
     pub fn finish(&self, result: Result<()>) {
+        self.update(|inner| inner.finish(result));
+    }
+
+    /// Record the result of Cronet's last callback for the request.
+    fn terminate(&self, result: Result<()>) {
         self.update(|inner| {
-            if inner.finished.is_none() {
-                inner.finished = Some(result);
-            }
-            inner.read_outstanding = false;
+            inner.terminated = true;
+            inner.finish(result);
         });
+    }
+
+    fn allocate_read_buffer(&self, env: &mut Env) -> Result<()> {
+        let buffer = env
+            .call_static_method(
+                jni_str!("java/nio/ByteBuffer"),
+                jni_str!("allocateDirect"),
+                jni_sig!("(I)Ljava/nio/ByteBuffer;"),
+                &[JValue::Int(READ_BUFFER_SIZE)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| java_error(env, "ByteBuffer.allocateDirect", e))?;
+        let buffer = env
+            .new_global_ref(buffer)
+            .map_err(|e| java_error(env, "NewGlobalRef", e))?;
+        let _ = self.read_buffer.set(buffer);
+        Ok(())
     }
 
     /// Ask Cronet for the next chunk. The caller must have set
@@ -230,13 +312,13 @@ fn extract_headers(env: &mut Env, info: &JObject) -> Result<HeaderMap> {
             )
             .and_then(|v| v.l())
             .map_err(|e| java_error(env, "Entry.getValue", e))?;
-        if let (Some(key), Some(value)) = (java_string(env, &key), java_string(env, &value)) {
-            if let (Ok(name), Ok(value)) = (
+        if let (Some(key), Some(value)) = (java_string(env, &key), java_string(env, &value))
+            && let (Ok(name), Ok(value)) = (
                 http::HeaderName::from_bytes(key.as_bytes()),
                 http::HeaderValue::from_bytes(value.as_bytes()),
-            ) {
-                headers.append(name, value);
-            }
+            )
+        {
+            headers.append(name, value);
         }
         env.delete_local_ref(entry);
         env.delete_local_ref(key);
@@ -422,36 +504,33 @@ fn network_exception_class(env: &mut Env) -> Result<&'static Global<JClass<'stat
 /// Run a native callback's body with its JNI environment. The bodies handle
 /// their own errors, and a panic aborts, as from any `extern "system"`
 /// function.
-fn native<'local>(mut env: EnvUnowned<'local>, f: impl FnOnce(&mut Env<'local>)) {
-    env.with_env_no_catch(|env| {
-        f(env);
-        Ok::<_, jni::errors::Error>(())
-    })
-    .resolve::<LogErrorAndDefault>()
+fn native<'local, T: Default>(
+    mut env: EnvUnowned<'local>,
+    f: impl FnOnce(&mut Env<'local>) -> T,
+) -> T {
+    env.with_env_no_catch(|env| Ok::<_, jni::errors::Error>(f(env)))
+        .resolve::<LogErrorAndDefault>()
 }
 
 extern "system" fn native_on_redirect_received<'local>(
     env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handler_id: jlong,
-    request: JObject<'local>,
+    _request: JObject<'local>,
     info: JObject<'local>,
 ) {
     native(env, |env| {
         let Some(shared) = lookup(handler_id) else {
             return;
         };
-        if let Ok(headers) = extract_headers(env, &info) {
-            shared.update(|inner| {
-                inner.redirect_headers.push(headers);
+        // `info` is the redirect response itself: its URL is the one that
+        // answered, not where the redirect leads.
+        match extract_head(env, &info) {
+            Ok(head) => shared.update(|inner| {
+                inner.redirect = Some(head);
                 inner.activity += 1;
-            });
-        }
-        if let Err(error) =
-            env.call_method(&request, jni_str!("followRedirect"), jni_sig!("()V"), &[])
-        {
-            let error = java_error(env, "UrlRequest.followRedirect", error);
-            shared.finish(Err(error));
+            }),
+            Err(error) => shared.finish(Err(error)),
         }
     })
 }
@@ -468,7 +547,11 @@ extern "system" fn native_on_response_started<'local>(
             return;
         };
         let received = received_byte_count(env, &info);
-        match extract_head(env, &info) {
+        let head = extract_head(env, &info).and_then(|head| {
+            shared.allocate_read_buffer(env)?;
+            Ok(head)
+        });
+        match head {
             Ok(head) => {
                 let (accounting, baseline) = body_accounting(env, &info, &head.headers, received);
                 let read = shared.update(|inner| {
@@ -547,7 +630,7 @@ extern "system" fn native_on_succeeded<'local>(
             let received = received_byte_count(env, &info);
             // The count must be final before the body can end.
             shared.update(|inner| inner.record_received(received));
-            shared.finish(Ok(()));
+            shared.terminate(Ok(()));
         }
         unregister(handler_id);
     })
@@ -565,9 +648,12 @@ extern "system" fn native_on_failed<'local>(
         if let Some(shared) = lookup(handler_id) {
             let received = received_byte_count(env, &info);
             let error = cronet_error(env, &exception);
-            shared.update(|inner| inner.record_received(received));
+            let error = shared.update(|inner| {
+                inner.record_received(received);
+                inner.upload_error.take().unwrap_or(error)
+            });
             tracing::debug!("Cronet request {} failed: {}", handler_id, error);
-            shared.finish(Err(error));
+            shared.terminate(Err(error));
         }
         unregister(handler_id);
     })
@@ -581,26 +667,81 @@ extern "system" fn native_on_canceled<'local>(
     _info: JObject<'local>,
 ) {
     if let Some(shared) = lookup(handler_id) {
-        shared.finish(Err(Error::Cancelled));
+        shared.terminate(Err(Error::Cancelled));
     }
     unregister(handler_id);
 }
 
-extern "system" fn native_on_upload_progress<'local>(
-    _env: EnvUnowned<'local>,
+/// `RustUploadDataProvider.nativeRead`: copy the body's bytes at `offset`
+/// into `buffer` from `position`, at most `remaining` of them, and return how
+/// many, or -1 if the body could not be read. Runs on the upload executor,
+/// where reading a file may block.
+extern "system" fn native_upload_read<'local>(
+    env: EnvUnowned<'local>,
     _class: JClass<'local>,
     handler_id: jlong,
-    bytes_uploaded: jlong,
-    total_bytes: jlong,
-) {
-    let Some(shared) = lookup(handler_id) else {
-        return;
-    };
-    shared.update(|inner| inner.activity += 1);
-    if let Some(callback) = &shared.upload_progress {
-        let total = (total_bytes >= 0).then_some(total_bytes as u64);
-        callback(bytes_uploaded as u64, total);
+    offset: jlong,
+    buffer: JByteBuffer<'local>,
+    position: jint,
+    remaining: jint,
+) -> jint {
+    native(env, |env| {
+        let Some(shared) = lookup(handler_id) else {
+            return -1;
+        };
+        match upload_read(env, &shared, offset, &buffer, position, remaining) {
+            Ok(read) => read,
+            Err(error) => {
+                shared.update(|inner| inner.upload_error = Some(error));
+                -1
+            }
+        }
+    })
+}
+
+fn upload_read(
+    env: &mut Env,
+    shared: &RequestShared,
+    offset: jlong,
+    buffer: &JByteBuffer,
+    position: jint,
+    remaining: jint,
+) -> Result<jint> {
+    let invalid = || Error::Internal("Invalid upload read from Cronet".to_string());
+    let source = shared.upload.as_ref().ok_or_else(invalid)?;
+    let offset = u64::try_from(offset).map_err(|_| invalid())?;
+    let position = usize::try_from(position).map_err(|_| invalid())?;
+    let remaining = usize::try_from(remaining).map_err(|_| invalid())?;
+
+    let address = env
+        .get_direct_buffer_address(buffer)
+        .map_err(|e| java_error(env, "GetDirectBufferAddress", e))?;
+    let capacity = env
+        .get_direct_buffer_capacity(buffer)
+        .map_err(|e| java_error(env, "GetDirectBufferCapacity", e))?;
+    if position
+        .checked_add(remaining)
+        .is_none_or(|end| end > capacity)
+    {
+        return Err(invalid());
     }
+
+    let chunk = source.chunk(offset, remaining)?;
+    // SAFETY: `address` is the start of a direct buffer of `capacity` bytes,
+    // and the chunk is at most `remaining` bytes, so the copy ends within it,
+    // as checked above. Cronet lends the buffer to the provider until the
+    // read is answered, which the Java caller does after this returns, and
+    // puts off freeing it until then if the request is cancelled meanwhile.
+    // The chunk is Rust memory, so the two cannot overlap.
+    unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), address.add(position), chunk.len()) };
+
+    shared.update(|inner| inner.activity += 1);
+    if !chunk.is_empty()
+        && let Some(progress) = &shared.upload_progress
+    {
+        progress(offset + chunk.len() as u64, Some(source.len()));
+    }
+    jint::try_from(chunk.len()).map_err(|_| invalid())
 }
 
 /// Embedded DEX with `RustUrlRequestCallback` and the other helper classes,
@@ -732,21 +873,20 @@ fn callback_class(env: &mut Env) -> Result<&'static Global<JClass<'static>>> {
     )
 }
 
-/// The `UploadDataProvider` that reports progress for a handler id.
-pub(crate) fn upload_provider_class(env: &mut Env) -> Result<&'static Global<JClass<'static>>> {
+fn upload_provider_class(env: &mut Env) -> Result<&'static Global<JClass<'static>>> {
     // SAFETY: the function takes the arguments of the signature, after the
-    // env and the class.
+    // env and the class, and returns the type the signature declares.
     let natives = [unsafe {
         NativeMethod::from_raw_parts(
-            jni_str!("nativeOnUploadProgress"),
-            jni_sig_jstr!("(JJJ)V"),
-            native_on_upload_progress as *mut std::ffi::c_void,
+            jni_str!("nativeRead"),
+            jni_sig_jstr!("(JJLjava/nio/ByteBuffer;II)I"),
+            native_upload_read as *mut std::ffi::c_void,
         )
     }];
     dex_class_with_natives(
         env,
         &UPLOAD_PROVIDER_CLASS,
-        "se.brendan.frakt.ProgressTrackingUploadDataProvider",
+        "se.brendan.frakt.RustUploadDataProvider",
         &natives,
     )
 }
@@ -759,6 +899,22 @@ pub(crate) fn create_callback_instance<'a>(
     let class = callback_class(env)?;
     env.new_object(class, jni_sig!("(J)V"), &[JValue::Long(handler_id)])
         .map_err(|e| java_error(env, "RustUrlRequestCallback.<init>", e))
+}
+
+/// A `RustUploadDataProvider` that sends `length` bytes of the body of the
+/// handler `handler_id`.
+pub(crate) fn create_upload_provider<'a>(
+    env: &mut Env<'a>,
+    handler_id: jlong,
+    length: jlong,
+) -> Result<JObject<'a>> {
+    let class = upload_provider_class(env)?;
+    env.new_object(
+        class,
+        jni_sig!("(JJ)V"),
+        &[JValue::Long(handler_id), JValue::Long(length)],
+    )
+    .map_err(|e| java_error(env, "RustUploadDataProvider.<init>", e))
 }
 
 #[cfg(test)]

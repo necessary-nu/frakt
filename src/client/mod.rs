@@ -13,7 +13,7 @@ pub use upload::UploadBuilder;
 use url::Url;
 
 /// Proxy configuration for requests
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProxyConfig {
     /// Proxy host
     pub host: String,
@@ -23,6 +23,19 @@ pub struct ProxyConfig {
     pub username: Option<String>,
     /// Optional password for authentication
     pub password: Option<String>,
+}
+
+/// The credentials are not shown, only whether they are set.
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::redact::redacted_option;
+        f.debug_struct("ProxyConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &redacted_option(&self.username))
+            .field("password", &redacted_option(&self.password))
+            .finish()
+    }
 }
 
 /// HTTP client for making requests
@@ -339,16 +352,26 @@ impl Client {
 
     /// Create a background download builder for downloads that survive app termination.
     ///
-    /// Background downloads continue even when the application is closed or the system
-    /// is restarted. The behavior varies by platform:
-    /// - **Apple platforms**: Uses NSURLSession background downloads
-    /// - **Unix platforms**: Uses daemon processes
-    /// - **Other platforms**: Uses resumable downloads with retry logic
+    /// How far a download survives depends on the backend:
+    /// - **Apple platforms** (Foundation backend): Uses NSURLSession background downloads
+    /// - **reqwest backend**: Uses a resumable download. The body is kept in a partial
+    ///   file next to `path`, and the file at `path` is replaced in one step once the
+    ///   download is complete; a later call with the same URL and path carries on where
+    ///   an interrupted one stopped. The download runs in the task that awaits it,
+    ///   unless the program called
+    ///   [`enable_background_helper`](crate::enable_background_helper) at the top of
+    ///   `main`: on Unix it then runs in a detached helper process that outlives the
+    ///   app.
     ///
     /// # Arguments
     ///
     /// * `url` - The URL to download from
     /// * `path` - The local file path where the downloaded content should be saved
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidUrl`](crate::Error::InvalidUrl) if `url` is not a
+    /// valid URL.
     ///
     /// # Examples
     ///
@@ -357,7 +380,7 @@ impl Client {
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Client::new()?;
     /// let response = client
-    ///     .download_background("https://httpbin.org/bytes/1073741824", "updates/app-v2.0.dmg") // 1GB file
+    ///     .download_background("https://httpbin.org/bytes/1073741824", "updates/app-v2.0.dmg")? // 1GB file
     ///     .session_identifier("app-update-v2.0")
     ///     .progress(|downloaded, total| {
     ///         if let Some(total) = total {
@@ -367,8 +390,7 @@ impl Client {
     ///     .send()
     ///     .await?;
     ///
-    /// println!("Background download started for: {:?}", response.file_path);
-    /// // App can now terminate - download continues in background
+    /// println!("Background download finished: {:?}", response.file_path);
     /// # Ok(())
     /// # }
     /// ```
@@ -376,14 +398,12 @@ impl Client {
         &self,
         url: impl TryInto<Url>,
         path: P,
-    ) -> BackgroundDownloadBuilder {
-        BackgroundDownloadBuilder::new(
+    ) -> crate::Result<BackgroundDownloadBuilder> {
+        Ok(BackgroundDownloadBuilder::new(
             self.backend.clone(),
-            url.try_into()
-                .map_err(|_| crate::Error::InvalidUrl)
-                .unwrap(),
+            url.try_into().map_err(|_| crate::Error::InvalidUrl)?,
             path.as_ref().to_path_buf(),
-        )
+        ))
     }
 
     /// Create an upload builder for uploading files or data.
@@ -498,45 +518,14 @@ impl Client {
         }
     }
 
-    /// Get the cookie jar (if available).
+    /// Get the cookie jar this client sends cookies from and stores them
+    /// into, on every backend.
     ///
-    /// Returns a reference to the client's cookie jar if cookie handling is enabled
-    /// and the backend supports exposing the cookie jar. Currently returns `None`
-    /// as cookie jars are handled internally by the backends.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some(&CookieJar)` if a cookie jar is available for inspection,
-    /// or `None` if cookies are disabled or handled internally by the backend.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use frakt::Client;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = Client::builder()
-    ///     .use_cookies(true)
-    ///     .build()?;
-    ///
-    /// // Make a request that might set cookies
-    /// let _response = client
-    ///     .get("https://httpbin.org/cookies/set/session/abc123")?
-    ///     .send()
-    ///     .await?;
-    ///
-    /// // Check if cookie jar is available (currently returns None)
-    /// if let Some(jar) = client.cookie_jar() {
-    ///     println!("Cookie jar contains cookies");
-    /// } else {
-    ///     println!("Cookie jar not available for inspection");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    /// Get access to the cookie jar for this client, if cookies are enabled.
-    ///
-    /// Returns `None` if cookies were not enabled during client construction.
-    /// Use `.use_cookies(true)` on the builder to enable cookie support.
+    /// This is the jar given to [`ClientBuilder::cookie_jar`], or the
+    /// client's own if cookies were turned on with
+    /// [`ClientBuilder::use_cookies`] alone. Cookies added to it are sent
+    /// with later requests, and cookies servers set show up in it. Returns
+    /// `None` if the client does not keep cookies.
     ///
     /// # Examples
     ///
@@ -687,13 +676,22 @@ impl ClientBuilder {
         Ok(self)
     }
 
-    /// Enable or disable cookie handling
+    /// Enable or disable cookie handling. Cookies are off unless this is
+    /// set or a jar is given with [`cookie_jar`](Self::cookie_jar);
+    /// `use_cookies(false)` turns them off even when a jar was given.
     pub fn use_cookies(mut self, use_cookies: bool) -> Self {
         self.config.use_cookies = Some(use_cookies);
         self
     }
 
-    /// Set a custom cookie jar
+    /// Keep this client's cookies in `jar`, which turns cookies on.
+    ///
+    /// The client sends from and stores into this jar, and
+    /// [`Client::cookie_jar`] returns it, so several clients can share one
+    /// and the caller can preload, inspect and remove cookies. A jar is
+    /// tied to a kind of storage (see [`CookieJar::new`](crate::CookieJar::new));
+    /// [`build`](Self::build) fails if the client's backend cannot use the
+    /// jar's kind.
     pub fn cookie_jar(mut self, jar: crate::CookieJar) -> Self {
         self.config.cookie_jar = Some(jar);
         self

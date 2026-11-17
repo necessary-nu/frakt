@@ -130,7 +130,7 @@ define_class!(
                 );
 
                 // Check if this is a server trust challenge
-                if auth_method.isEqualToString(&NSURLAuthenticationMethodServerTrust) {
+                if auth_method.isEqualToString(NSURLAuthenticationMethodServerTrust) {
                     tracing::debug!(
                         "WebSocketDelegate::URLSession_task_didReceiveChallenge_completionHandler - Server trust challenge"
                     );

@@ -10,20 +10,39 @@ use crate::client::download::DownloadResponse;
 ///
 /// Platform-specific behavior:
 /// - **Apple platforms**: Uses NSURLSession background downloads
-/// - **Unix platforms**: Uses double-fork daemon process with reqwest
-/// - **Other platforms**: Uses resumable downloads with retry logic
+/// - **reqwest backend**: Uses a resumable download, in the task that awaits
+///   [`send`](Self::send) or, on Unix once the program has called
+///   [`enable_background_helper`](crate::enable_background_helper) at the top
+///   of `main`, in a detached helper process that outlives the app
 ///
 /// All platforms support:
 /// - Progress callbacks
 /// - Automatic resume on failure
 /// - Session identifiers for tracking
+///
+/// # The reqwest backend
+///
+/// The body is written to `<file name>.frakt-partial` next to the
+/// destination, with `<file name>.frakt-partial.meta` beside it recording
+/// which response the bytes came from. The destination itself is replaced in
+/// one step once the download is complete, so it never holds part of a
+/// download, and a file already there is left alone if the download fails.
+///
+/// A later download of the same URL to the same destination carries on from
+/// the partial file if the server confirms, by strong ETag or by
+/// Last-Modified, that it still has the same content, and starts again from
+/// the beginning otherwise. Transport failures are retried a few times
+/// before the download fails; there is no overall time limit.
+///
+/// Only one download to a destination runs at a time. A second fails with
+/// [`Error::Io`](crate::Error::Io) while the first holds the partial file.
 pub struct BackgroundDownloadBuilder {
     backend: Backend,
     url: Url,
     session_identifier: Option<String>,
     file_path: Option<std::path::PathBuf>,
     headers: HeaderMap,
-    progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+    progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
     error_for_status: bool,
 }
 
@@ -52,6 +71,9 @@ impl BackgroundDownloadBuilder {
     /// handler in a later launch; this builder's future only completes in
     /// the process that started the download.
     ///
+    /// The reqwest backend has no use for the identifier: what a download
+    /// leaves on disk is named after its destination alone.
+    ///
     /// # Arguments
     ///
     /// * `identifier` - A unique string to identify this download session
@@ -63,7 +85,7 @@ impl BackgroundDownloadBuilder {
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Client::new()?;
     /// let response = client
-    ///     .download_background("https://httpbin.org/bytes/10485760", "updates/app-v1.2.3.zip") // 10MB
+    ///     .download_background("https://httpbin.org/bytes/10485760", "updates/app-v1.2.3.zip")? // 10MB
     ///     .session_identifier("my-app-update-v1.2.3")
     ///     .send()
     ///     .await?;
@@ -89,8 +111,10 @@ impl BackgroundDownloadBuilder {
     /// # Platform Behavior
     ///
     /// - **Apple platforms**: Progress is maintained by NSURLSession across app restarts
-    /// - **Unix platforms**: Progress is tracked by the daemon process
-    /// - **Other platforms**: Progress is only available while the app is running
+    /// - **reqwest backend**: Progress is reported for as long as the future returned
+    ///   by `send` is awaited, also when the download runs in the helper process. It
+    ///   counts the bytes of the file, so a resumed download starts where the
+    ///   earlier one stopped, and the last call reports the whole file.
     ///
     /// # Examples
     ///
@@ -99,7 +123,7 @@ impl BackgroundDownloadBuilder {
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Client::new()?;
     /// let response = client
-    ///     .download_background("https://httpbin.org/bytes/1073741824", "huge_download.bin") // 1GB
+    ///     .download_background("https://httpbin.org/bytes/1073741824", "huge_download.bin")? // 1GB
     ///     .progress(|bytes_downloaded, total_bytes| {
     ///         match total_bytes {
     ///             Some(total) => {
@@ -154,7 +178,7 @@ impl BackgroundDownloadBuilder {
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Client::new()?;
     /// let response = client
-    ///     .download_background("https://api.example.com/protected-large-file.zip", "protected_large_file.zip")
+    ///     .download_background("https://api.example.com/protected-large-file.zip", "protected_large_file.zip")?
     ///     .session_identifier("protected-download")
     ///     .header("Authorization", "Bearer token123")?
     ///     .header("User-Agent", "MyApp/1.0")?
@@ -201,7 +225,7 @@ impl BackgroundDownloadBuilder {
     ///
     /// // Bearer token for authenticated background download
     /// let response = client
-    ///     .download_background("https://api.example.com/premium-content.zip", "premium_content.zip")
+    ///     .download_background("https://api.example.com/premium-content.zip", "premium_content.zip")?
     ///     .session_identifier("premium-content-download")
     ///     .auth(Auth::bearer("your-api-token"))?
     ///     .send()
@@ -209,7 +233,7 @@ impl BackgroundDownloadBuilder {
     ///
     /// // Basic authentication
     /// let response = client
-    ///     .download_background("https://secure.example.com/data.zip", "secure_data.zip")
+    ///     .download_background("https://secure.example.com/data.zip", "secure_data.zip")?
     ///     .session_identifier("secure-data-download")
     ///     .auth(Auth::basic("username", "password"))?
     ///     .send()
@@ -218,17 +242,15 @@ impl BackgroundDownloadBuilder {
     /// # }
     /// ```
     pub fn auth(mut self, auth: crate::Auth) -> crate::Result<Self> {
-        let header_value = http::HeaderValue::from_str(&auth.to_header_value())
-            .map_err(|_| crate::Error::InvalidHeader)?;
         self.headers
-            .insert(http::header::AUTHORIZATION, header_value);
+            .insert(http::header::AUTHORIZATION, auth.header_value()?);
         Ok(self)
     }
 
     /// Configure whether to return an error for HTTP error status codes (>= 400).
     ///
     /// When enabled (the default), responses with status codes >= 400 will return
-    /// an `HttpError` containing the full response without downloading the file.
+    /// [`Error::HttpStatus`](crate::Error::HttpStatus) without downloading the file.
     /// When disabled, all status codes are treated as success and the file will be
     /// downloaded regardless of the status code.
     ///
@@ -245,7 +267,7 @@ impl BackgroundDownloadBuilder {
     ///
     /// // Download a 404 error page in background
     /// let response = client
-    ///     .download_background("https://httpbin.org/status/404", "error.html")
+    ///     .download_background("https://httpbin.org/status/404", "error.html")?
     ///     .session_identifier("test-404")
     ///     .error_for_status(false)
     ///     .send()
@@ -273,7 +295,7 @@ impl BackgroundDownloadBuilder {
     ///
     /// // Download a 404 error page in background
     /// let response = client
-    ///     .download_background("https://httpbin.org/status/404", "error.html")
+    ///     .download_background("https://httpbin.org/status/404", "error.html")?
     ///     .session_identifier("test-404")
     ///     .allow_error_status()
     ///     .send()
@@ -287,19 +309,27 @@ impl BackgroundDownloadBuilder {
         self.error_for_status(false)
     }
 
-    /// Start the background download and return immediately.
+    /// Start the background download and wait for its result.
     ///
-    /// This method initiates a background download that will continue even if the
-    /// application is terminated. The download behavior varies by platform:
+    /// The download behavior varies by platform:
     ///
     /// - **Apple platforms**: Uses NSURLSession background downloads
-    /// - **Unix platforms**: Spawns a daemon process using double-fork
-    /// - **Other platforms**: Uses resumable downloads with retry logic
+    /// - **reqwest backend**: Downloads in the awaiting task, carrying on from
+    ///   what an earlier download to the same destination left behind, and
+    ///   stops if the returned future is dropped. On Unix, once the program
+    ///   has called [`enable_background_helper`](crate::enable_background_helper)
+    ///   at the top of `main`, a detached helper process downloads instead:
+    ///   dropping the future, or the app exiting, then only ends the waiting.
     ///
     /// # Returns
     ///
-    /// Returns a `DownloadResponse` immediately with initial download information.
-    /// The actual download continues in the background.
+    /// Returns a `DownloadResponse` once the file is complete at its destination,
+    /// with the headers of the response that completed it and
+    /// `bytes_downloaded` the length of the file. On the reqwest backend a
+    /// download that was resumed reports `200`, whichever exchange finished
+    /// it (a `206` with the rest of the file, or a `304` or `416` confirming
+    /// that an earlier attempt had already fetched every byte); the headers
+    /// are still that exchange's.
     ///
     /// # Errors
     ///
@@ -308,6 +338,7 @@ impl BackgroundDownloadBuilder {
     /// - The parent directory cannot be created
     /// - The background download session cannot be started
     /// - Platform-specific background services are unavailable
+    /// - Another download to the same destination is in progress (reqwest backend)
     ///
     /// # Examples
     ///
@@ -318,7 +349,7 @@ impl BackgroundDownloadBuilder {
     ///
     /// // Start a background download that survives app termination
     /// let response = client
-    ///     .download_background("https://httpbin.org/bytes/1073741824", "updates/app-v2.0.dmg") // 1GB
+    ///     .download_background("https://httpbin.org/bytes/1073741824", "updates/app-v2.0.dmg")? // 1GB
     ///     .session_identifier("app-update-v2.0")
     ///     .progress(|downloaded, total| {
     ///         // This will be called even after app restart on supported platforms
@@ -329,8 +360,7 @@ impl BackgroundDownloadBuilder {
     ///     .send()
     ///     .await?;
     ///
-    /// println!("Background download started for: {:?}", response.file_path);
-    /// // App can now terminate - download continues in background
+    /// println!("Background download finished: {:?}", response.file_path);
     /// # Ok(())
     /// # }
     /// ```

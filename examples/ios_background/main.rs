@@ -174,11 +174,15 @@ mod app {
                         .build()
                         .unwrap();
                     let path = documents().join("client.bin");
-                    let result = client
-                        .download_background(url.as_str(), &path)
-                        .session_identifier("se.brendan.frakt.bgharness.client")
-                        .send()
-                        .await;
+                    let result = match client.download_background(url.as_str(), &path) {
+                        Ok(download) => {
+                            download
+                                .session_identifier("se.brendan.frakt.bgharness.client")
+                                .send()
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     log(match result {
                         Ok(response) => serde_json::json!({
                             "event": "client-finished",

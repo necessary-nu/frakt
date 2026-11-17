@@ -15,7 +15,7 @@ pub struct Request {
     pub(crate) headers: HeaderMap,
     pub(crate) body: Option<Body>,
     pub(crate) backend: Backend,
-    pub(crate) progress_callback: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+    pub(crate) progress_callback: Option<crate::backend::types::ProgressCallback>,
     pub(crate) error_for_status: bool,
     pub(crate) timeout: Option<Duration>,
     pub(crate) read_timeout: Option<Duration>,
@@ -83,7 +83,7 @@ pub struct RequestBuilder {
     headers: HeaderMap,
     body: Option<Body>,
     backend: Backend,
-    progress_callback: Option<Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+    progress_callback: Option<crate::backend::types::ProgressCallback>,
     error_for_status: bool,
     timeout: Option<Duration>,
     read_timeout: Option<Duration>,
@@ -149,12 +149,25 @@ impl RequestBuilder {
         self
     }
 
-    /// Set authentication for the request
-    pub fn auth(mut self, auth: crate::Auth) -> Self {
-        let header_value =
-            HeaderValue::from_str(&auth.to_header_value()).expect("Invalid auth header value");
-        self.headers.insert(header::AUTHORIZATION, header_value);
+    /// Replace the request's headers, for the builders that collect a
+    /// whole map before the request exists.
+    pub(crate) fn headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
         self
+    }
+
+    /// Set authentication for the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`](crate::Error::InvalidHeader) if the
+    /// credentials cannot be sent as an `Authorization` header: a custom
+    /// scheme that is not an HTTP token, or a token or credentials
+    /// containing a line break or other control character.
+    pub fn auth(mut self, auth: crate::Auth) -> Result<Self> {
+        self.headers
+            .insert(header::AUTHORIZATION, auth.header_value()?);
+        Ok(self)
     }
 
     /// Set progress callback

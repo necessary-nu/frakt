@@ -1,6 +1,16 @@
 //! Backend abstraction for HTTP client implementations
 
 pub mod cookie_store;
+// Foundation follows redirects itself and uses only the origin comparison.
+#[cfg_attr(
+    not(any(
+        feature = "backend-reqwest",
+        all(feature = "backend-winhttp", windows),
+        all(feature = "backend-android", target_os = "android")
+    )),
+    allow(dead_code)
+)]
+pub(crate) mod redirect;
 pub mod types;
 
 #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
@@ -66,9 +76,19 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// body as the server encoded it (it would otherwise rewrite the header);
 /// `is_decoded()` tells which happened.
 ///
+/// Every backend follows redirects, up to ten on the backends that count
+/// them (Foundation follows CFNetwork's own limit). A redirect to another
+/// origin (scheme, host or port) is followed without the request's
+/// credentials: `Authorization`, `Cookie`, `Proxy-Authorization` and any
+/// other header whose name marks it as one, such as an API key or token.
+/// Cookies come from the jar afresh for each hop, and a cookie a hop sets is
+/// stored for that hop's origin. A redirect within the origin keeps every
+/// header. 303, and 301 or 302 in answer to a POST, are followed with a GET
+/// and no body; 307 and 308 repeat the request, body included.
+///
 /// [`Response::is_decoded`]: crate::Response::is_decoded
 /// [`Response::body_stats`]: crate::Response::body_stats
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackendConfig {
     /// Total deadline per request; `None` (the default) for no deadline
     pub timeout: Option<Duration>,
@@ -92,6 +112,67 @@ pub struct BackendConfig {
     pub https_proxy: Option<crate::client::ProxyConfig>,
     /// SOCKS proxy configuration
     pub socks_proxy: Option<crate::client::ProxyConfig>,
+}
+
+impl std::fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .field("user_agent", &self.user_agent)
+            .field("ignore_certificate_errors", &self.ignore_certificate_errors)
+            .field(
+                "default_headers",
+                &self
+                    .default_headers
+                    .as_ref()
+                    .map(crate::redact::RedactedHeaders),
+            )
+            .field("use_cookies", &self.use_cookies)
+            .field("cookie_jar", &self.cookie_jar)
+            .field("http_proxy", &self.http_proxy)
+            .field("https_proxy", &self.https_proxy)
+            .field("socks_proxy", &self.socks_proxy)
+            .finish()
+    }
+}
+
+impl BackendConfig {
+    /// Whether the client keeps cookies: `use_cookies` if set, otherwise
+    /// whether a jar was supplied.
+    pub(crate) fn cookies_enabled(&self) -> bool {
+        self.use_cookies.unwrap_or(self.cookie_jar.is_some())
+    }
+
+    /// The jar a backend that keeps its cookies in a `cookie_store` (every
+    /// backend but Foundation) sends from and stores into, which is also
+    /// the one `Client::cookie_jar` hands out: the caller's jar, or a new
+    /// one. `None` when cookies are off. A jar backed by another kind of
+    /// storage cannot be honoured and is an error rather than being
+    /// silently replaced.
+    #[cfg_attr(
+        not(any(
+            feature = "backend-reqwest",
+            all(feature = "backend-winhttp", windows),
+            all(feature = "backend-android", target_os = "android")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn cookie_store_jar(&self) -> Result<Option<crate::CookieJar>> {
+        if !self.cookies_enabled() {
+            return Ok(None);
+        }
+        match &self.cookie_jar {
+            Some(jar) if jar.cookie_store().is_some() => Ok(Some(jar.clone())),
+            Some(_) => Err(Error::Internal(
+                "The cookie jar is backed by NSHTTPCookieStorage, which only the Foundation \
+                 backend can use"
+                    .to_string(),
+            )),
+            None => Ok(Some(crate::CookieJar::with_cookie_store())),
+        }
+    }
 }
 
 impl Default for BackendConfig {
@@ -248,7 +329,7 @@ impl Backend {
         file_path: std::path::PathBuf,
         session_identifier: Option<String>,
         headers: http::HeaderMap,
-        progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+        progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
         error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
         match self {

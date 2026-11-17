@@ -26,7 +26,10 @@ mod server;
 #[cfg(vampire)]
 use crate as frakt;
 
-use frakt::{BackendType, BodyIntegrity, Client, ClientBuilder, Error};
+use frakt::{
+    Auth, BackendType, BodyIntegrity, Client, ClientBuilder, Cookie, CookieAcceptPolicy, CookieJar,
+    Error,
+};
 use server::Server;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1090,6 +1093,750 @@ async fn progress_callbacks(backend: BackendType) {
     assert_eq!(calls.last(), Some(&(2 * MIB, Some(2 * MIB))), "{:?}", calls);
 }
 
+fn temp_dir() -> tempfile::TempDir {
+    if cfg!(target_os = "android") {
+        tempfile::tempdir_in("/data/data/com.vampire.host/cache").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
+
+fn encode(value: &str) -> String {
+    urlencoding::encode(value).into_owned()
+}
+
+/// The server's address under another host name: the same listener, but a
+/// different origin to a client.
+fn other_origin(url: &str) -> String {
+    url.replace("127.0.0.1", "localhost")
+}
+
+/// Whether `backend` can reach the server under a second host name here.
+/// reqwest's resolver finds no address for `localhost` inside the Android
+/// emulator, where only the loopback address itself works.
+fn has_second_origin(backend: BackendType) -> bool {
+    #[cfg(all(target_os = "android", feature = "backend-reqwest"))]
+    if matches!(backend, BackendType::Reqwest) {
+        return false;
+    }
+    let _ = backend;
+    true
+}
+
+/// GET `url` and return what `/echo` says it received.
+async fn echoed(client: &Client, url: &str) -> serde_json::Value {
+    let response = client.get(url).unwrap().send().await.unwrap();
+    assert_eq!(response.status(), 200, "{}", url);
+    response.json().await.unwrap()
+}
+
+/// The request's `Cookie` header as `/echo` reported it, or "".
+fn echoed_cookie(echo: &serde_json::Value) -> String {
+    echo["headers"]["cookie"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn cookie_pairs(jar: &CookieJar, url: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<_> = jar
+        .cookies_for_url(url)
+        .unwrap()
+        .into_iter()
+        .map(|cookie| (cookie.name, cookie.value))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+fn pair(name: &str, value: &str) -> (String, String) {
+    (name.to_string(), value.to_string())
+}
+
+/// A redirect to another origin must not take the caller's credentials
+/// with it; one within the origin keeps them.
+async fn redirects_do_not_leak_credentials(backend: BackendType) {
+    if !has_second_origin(backend) {
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+    let elsewhere = other_origin(&server.url("/echo"));
+
+    let send = |url: String| {
+        let request = client
+            .get(url.as_str())
+            .unwrap()
+            .auth(Auth::bearer("s3cret-token"))
+            .unwrap()
+            .header("cookie", "sid=s3cret-cookie")
+            .unwrap()
+            .header("x-api-key", "s3cret-key")
+            .unwrap()
+            .header("x-plain", "kept")
+            .unwrap();
+        async move {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 200, "{}", url);
+            let host = response.url().host_str().map(str::to_string);
+            let echo: serde_json::Value = response.json().await.unwrap();
+            (host, echo)
+        }
+    };
+
+    for status in [301, 302, 303, 307, 308] {
+        let (host, echo) = send(server.url(&format!(
+            "/redirect?status={}&to={}",
+            status,
+            encode(&elsewhere)
+        )))
+        .await;
+        assert_eq!(host.as_deref(), Some("localhost"));
+        let headers = &echo["headers"];
+        assert!(
+            headers.get("authorization").is_none(),
+            "{:?} {}: Authorization crossed origins: {}",
+            backend,
+            status,
+            headers
+        );
+        assert!(
+            headers.get("cookie").is_none(),
+            "{:?} {}: Cookie crossed origins: {}",
+            backend,
+            status,
+            headers
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "{:?} {}: an API key crossed origins: {}",
+            backend,
+            status,
+            headers
+        );
+        assert_eq!(headers["x-plain"], "kept", "{:?} {}", backend, status);
+    }
+
+    // Credentials that were left behind do not come back when a chain
+    // returns to the origin it started from.
+    let back = format!(
+        "{}?to={}",
+        other_origin(&server.url("/redirect")),
+        encode(&server.url("/echo"))
+    );
+    let (host, echo) = send(server.url(&format!("/redirect?to={}", encode(&back)))).await;
+    assert_eq!(host.as_deref(), Some("127.0.0.1"));
+    for name in ["authorization", "cookie", "x-api-key"] {
+        assert!(
+            echo["headers"].get(name).is_none(),
+            "{:?}: {} came back after a detour: {}",
+            backend,
+            name,
+            echo["headers"]
+        );
+    }
+
+    for status in [302, 307] {
+        let (_, echo) = send(server.url(&format!("/redirect?status={}&to=/echo", status))).await;
+        let headers = &echo["headers"];
+        assert_eq!(
+            headers["authorization"], "Bearer s3cret-token",
+            "{:?} {}: {}",
+            backend, status, headers
+        );
+        assert_eq!(
+            headers["cookie"], "sid=s3cret-cookie",
+            "{:?} {}: {}",
+            backend, status, headers
+        );
+        assert_eq!(
+            headers["x-api-key"], "s3cret-key",
+            "{:?} {}: {}",
+            backend, status, headers
+        );
+    }
+}
+
+/// Every backend changes the method the same way when it follows a
+/// redirect, sends the body again when the method is kept, and gives up on
+/// a chain that does not end.
+async fn redirects_rewrite_methods_and_end(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+
+    for (method, status, arrives_as, body_kept) in [
+        ("POST", 301, "GET", false),
+        ("POST", 302, "GET", false),
+        ("POST", 303, "GET", false),
+        ("POST", 307, "POST", true),
+        ("POST", 308, "POST", true),
+        ("PUT", 303, "GET", false),
+        ("PUT", 307, "PUT", true),
+    ] {
+        let url = server.url(&format!("/redirect?status={}&to=/echo", status));
+        let request = match method {
+            "POST" => client.post(url.as_str()),
+            _ => client.put(url.as_str()),
+        }
+        .unwrap()
+        .body("payload");
+        let echo: serde_json::Value = request.send().await.unwrap().json().await.unwrap();
+        let case = format!("{:?}: {} answered with {}", backend, method, status);
+        assert_eq!(echo["method"], arrives_as, "{}", case);
+        assert_eq!(
+            echo["body"],
+            if body_kept { "payload" } else { "" },
+            "{}",
+            case
+        );
+    }
+
+    let response = client
+        .get(server.url("/hops?n=10").as_str())
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{:?}", backend);
+    assert!(response.url().path().ends_with("/echo"), "{:?}", backend);
+
+    let endless = client
+        .get(server.url("/hops?n=40").as_str())
+        .unwrap()
+        .send()
+        .await;
+    assert!(
+        matches!(endless, Err(Error::Network { .. })),
+        "{:?}: {:?}",
+        backend,
+        endless.map(|response| response.status())
+    );
+}
+
+/// A cookie set while redirecting belongs to the origin that set it, not to
+/// where the redirect led, and is sent on a later hop to its own origin.
+async fn redirect_cookies_stay_with_their_origin(backend: BackendType) {
+    if !has_second_origin(backend) {
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client_with(backend, |b| b.use_cookies(true));
+    let jar = client
+        .cookie_jar()
+        .expect("a client with cookies on exposes its jar");
+    let a = server.url("");
+    let b = other_origin(&a);
+
+    // A sets a cookie in the response that redirects to B.
+    let echo = echoed(
+        &client,
+        &format!(
+            "{}/redirect?to={}&cookie={}",
+            a,
+            encode(&format!("{}/echo", b)),
+            encode("sid=from-a; Path=/")
+        ),
+    )
+    .await;
+    assert_eq!(
+        echoed_cookie(&echo),
+        "",
+        "{:?}: A's cookie was sent to B",
+        backend
+    );
+    assert_eq!(cookie_pairs(jar, &format!("{}/", b)), []);
+    assert_eq!(
+        cookie_pairs(jar, &format!("{}/", a)),
+        [pair("sid", "from-a")]
+    );
+    assert_eq!(
+        echoed_cookie(&echoed(&client, &format!("{}/echo", a)).await),
+        "sid=from-a"
+    );
+
+    // B sets a cookie in the response that redirects back to A.
+    let echo = echoed(
+        &client,
+        &format!(
+            "{}/redirect?to={}&cookie={}",
+            b,
+            encode(&format!("{}/echo", a)),
+            encode("other=from-b; Path=/")
+        ),
+    )
+    .await;
+    assert_eq!(echoed_cookie(&echo), "sid=from-a", "{:?}", backend);
+    assert_eq!(
+        cookie_pairs(jar, &format!("{}/", b)),
+        [pair("other", "from-b")]
+    );
+
+    // A cookie from one hop is sent on the next hop to the same origin.
+    jar.clear();
+    let echo = echoed(
+        &client,
+        &format!("{}/redirect?to=/echo&cookie={}", a, encode("hop=1; Path=/")),
+    )
+    .await;
+    assert_eq!(echoed_cookie(&echo), "hop=1", "{:?}", backend);
+}
+
+/// The jar given to the builder is the one requests send from and store
+/// into, and the one the client hands back.
+async fn custom_cookie_jar_is_the_active_store(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let a = server.url("");
+    let origin = format!("{}/", a);
+
+    let jar =
+        CookieJar::new(frakt::backend::Backend::with_config(backend, Default::default()).unwrap());
+    // On Foundation this is the process's shared storage, which outlives
+    // the test: use names of our own and take them out again.
+    let preloaded = Cookie::new("frakt-test-pre", "1").domain("127.0.0.1");
+    let updated = Cookie::new("frakt-test-upd", "2").domain("127.0.0.1");
+    let _ = jar.remove_cookie(preloaded.clone());
+    let _ = jar.remove_cookie(updated.clone());
+
+    jar.add_cookie(preloaded.clone()).unwrap();
+    let client = client_with(backend, |b| b.cookie_jar(jar.clone()));
+    let from_client = client
+        .cookie_jar()
+        .expect("a client given a jar hands it back");
+
+    let echo = echoed(&client, &format!("{}/echo", a)).await;
+    assert_eq!(echoed_cookie(&echo), "frakt-test-pre=1", "{:?}", backend);
+
+    let response = client
+        .get(
+            format!(
+                "{}/set-cookie?cookie={}",
+                a,
+                encode("frakt-test-upd=2; Path=/")
+            )
+            .as_str(),
+        )
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    drop(response);
+    let both = [pair("frakt-test-pre", "1"), pair("frakt-test-upd", "2")];
+    assert_eq!(cookie_pairs(&jar, &origin), both, "{:?}", backend);
+    assert_eq!(cookie_pairs(from_client, &origin), both, "{:?}", backend);
+
+    jar.remove_cookie(preloaded).unwrap();
+    let echo = echoed(&client, &format!("{}/echo", a)).await;
+    assert_eq!(echoed_cookie(&echo), "frakt-test-upd=2", "{:?}", backend);
+
+    jar.remove_cookie(updated).unwrap();
+    let echo = echoed(&client, &format!("{}/echo", a)).await;
+    assert_eq!(echoed_cookie(&echo), "", "{:?}", backend);
+}
+
+/// Without `use_cookies` or a jar, nothing is kept or sent, and turning
+/// cookies off wins over a jar.
+async fn cookies_are_off_unless_asked_for(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let a = server.url("");
+
+    let jar =
+        CookieJar::new(frakt::backend::Backend::with_config(backend, Default::default()).unwrap());
+    for client in [
+        client(backend),
+        client_with(backend, |b| b.cookie_jar(jar.clone()).use_cookies(false)),
+    ] {
+        assert!(client.cookie_jar().is_none(), "{:?}", backend);
+        let response = client
+            .get(
+                format!(
+                    "{}/set-cookie?cookie={}",
+                    a,
+                    encode("frakt-test-off=1; Path=/")
+                )
+                .as_str(),
+            )
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        drop(response);
+        let echo = echoed(&client, &format!("{}/echo", a)).await;
+        assert_eq!(echoed_cookie(&echo), "", "{:?}", backend);
+    }
+    assert_eq!(cookie_pairs(&jar, &format!("{}/", a)), [], "{:?}", backend);
+}
+
+/// `Never` stores nothing, and `OnlyFromMainDocumentDomain` stores cookies
+/// from the host that was asked for but not from another host a redirect
+/// led to.
+async fn cookie_accept_policy_is_enforced(backend: BackendType) {
+    if !has_second_origin(backend) {
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client_with(backend, |b| b.use_cookies(true));
+    let jar = client.cookie_jar().unwrap();
+    let a = server.url("");
+    let b = other_origin(&a);
+
+    // The main document, A, sets `main` and redirects to B, which sets
+    // `other`.
+    let visit = |tag: &'static str| {
+        let url = format!(
+            "{}/redirect?cookie={}&to={}",
+            a,
+            encode(&format!("main-{}=1; Path=/", tag)),
+            encode(&format!(
+                "{}/set-cookie?cookie={}",
+                b,
+                encode(&format!("other-{}=1; Path=/", tag))
+            ))
+        );
+        let request = client.get(url.as_str()).unwrap();
+        async move {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.url().host_str(), Some("localhost"));
+        }
+    };
+    let stored = || {
+        (
+            cookie_pairs(jar, &format!("{}/", a)),
+            cookie_pairs(jar, &format!("{}/", b)),
+        )
+    };
+
+    jar.set_cookie_accept_policy(CookieAcceptPolicy::Never);
+    visit("never").await;
+    assert_eq!(stored(), (vec![], vec![]), "{:?}: Never", backend);
+
+    jar.set_cookie_accept_policy(CookieAcceptPolicy::OnlyFromMainDocumentDomain);
+    visit("main").await;
+    assert_eq!(
+        stored(),
+        (vec![pair("main-main", "1")], vec![]),
+        "{:?}: OnlyFromMainDocumentDomain",
+        backend
+    );
+
+    jar.clear();
+    jar.set_cookie_accept_policy(CookieAcceptPolicy::Always);
+    visit("always").await;
+    assert_eq!(
+        stored(),
+        (
+            vec![pair("main-always", "1")],
+            vec![pair("other-always", "1")]
+        ),
+        "{:?}: Always",
+        backend
+    );
+}
+
+/// Write `len` generated bytes to a new file in `dir`.
+fn generated_file(dir: &std::path::Path, name: &str, seed: u64, len: u64) -> std::path::PathBuf {
+    use std::io::Write;
+
+    let path = dir.join(name);
+    let mut file = std::fs::File::create(&path).unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut pos = 0;
+    while pos < len {
+        let n = ((len - pos) as usize).min(buf.len());
+        server::fill(seed, pos, &mut buf[..n]);
+        file.write_all(&buf[..n]).unwrap();
+        pos += n as u64;
+    }
+    path
+}
+
+/// A file upload arrives byte-exact with a Content-Length, reports its
+/// progress, and is read from disk as it goes: memory does not grow with
+/// the file.
+async fn file_upload_is_streamed_from_disk(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+    let dir = temp_dir();
+    let len = 96 * MIB;
+    let path = generated_file(dir.path(), "upload.bin", 11, len);
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let rss_start = rss();
+    let max_rss = Arc::new(AtomicU64::new(rss_start));
+    let sampler = {
+        let max_rss = max_rss.clone();
+        tokio::spawn(async move {
+            loop {
+                max_rss.fetch_max(rss(), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    let response = client
+        .upload(server.url("/sink").as_str())
+        .unwrap()
+        .from_file(&path)
+        .progress({
+            let calls = calls.clone();
+            move |sent, total| calls.lock().unwrap().push((sent, total))
+        })
+        .send()
+        .await
+        .unwrap();
+    sampler.abort();
+    assert_eq!(response.status(), 200);
+    let received: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(received["method"], "POST");
+    assert_eq!(received["len"], len);
+    assert_eq!(
+        received["blake3"],
+        server::body_hash(11, 0, len).to_hex().to_string()
+    );
+    assert_eq!(received["content_type"], "application/octet-stream");
+    assert!(received["transfer_encoding"].is_null(), "{}", received);
+
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.windows(2).all(|w| w[0].0 <= w[1].0), "{:?}", calls);
+    assert_eq!(calls.last(), Some(&(len, Some(len))), "{:?}", calls.last());
+    assert!(
+        calls.iter().any(|(sent, _)| *sent > 0 && *sent < len),
+        "progress was only reported at the ends: {:?}",
+        calls
+    );
+
+    let rss_growth = max_rss.load(Ordering::SeqCst).saturating_sub(rss_start);
+    println!(
+        "{:?}: {} MiB file upload, RSS grew {:.1} MiB",
+        backend,
+        len / MIB,
+        rss_growth as f64 / MIB as f64
+    );
+    assert!(
+        rss_growth < len / 2,
+        "RSS grew {} bytes uploading a {} byte file",
+        rss_growth,
+        len
+    );
+
+    // A redirect that keeps the method needs the file a second time.
+    let small = generated_file(dir.path(), "small.txt", 12, MIB);
+    let response = client
+        .upload(server.url("/redirect?status=307&to=/sink").as_str())
+        .unwrap()
+        .from_file(&small)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let received: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(received["method"], "POST");
+    assert_eq!(received["len"], MIB);
+    assert_eq!(
+        received["blake3"],
+        server::body_hash(12, 0, MIB).to_hex().to_string()
+    );
+    assert_eq!(received["content_type"], "text/plain");
+
+    assert!(matches!(
+        client
+            .upload(server.url("/sink").as_str())
+            .unwrap()
+            .from_file(dir.path().join("missing.bin"))
+            .send()
+            .await,
+        Err(Error::Io(_))
+    ));
+}
+
+/// Names in `dir`, to show a failed download left nothing behind.
+fn listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A download replaces its destination only once the whole body is on
+/// disk: a failed, timed-out or cancelled one leaves the previous file as
+/// it was and nothing else in the directory.
+async fn download_replaces_the_destination_only_on_success(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client_with(backend, |b| b.read_timeout(Duration::from_millis(500)));
+    let dir = temp_dir();
+    let destination = dir.path().join("artifact.bin");
+    const PREVIOUS: &[u8] = b"the previous, known-good artifact";
+    std::fs::write(&destination, PREVIOUS).unwrap();
+    let untouched = |case: &str| {
+        assert_eq!(std::fs::read(&destination).unwrap(), PREVIOUS, "{}", case);
+        assert_eq!(listing(dir.path()), ["artifact.bin"], "{}", case);
+    };
+
+    // The connection closes before the promised length.
+    let result = client
+        .download(
+            server.url("/truncate?len=4194304&after=1048576").as_str(),
+            &destination,
+        )
+        .unwrap()
+        .send()
+        .await;
+    assert!(result.is_err(), "{:?}", result);
+    untouched("short body");
+
+    // The body stalls past the read timeout.
+    let result = client
+        .download(
+            server
+                .url("/stall-body?len=1048576&after=65536&ms=5000")
+                .as_str(),
+            &destination,
+        )
+        .unwrap()
+        .send()
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)), "{:?}", result);
+    untouched("timeout");
+
+    // An error status, with and without a body to keep.
+    let result = client
+        .download(server.url("/status?code=404").as_str(), &destination)
+        .unwrap()
+        .send()
+        .await;
+    assert!(matches!(result, Err(Error::HttpError(_))), "{:?}", result);
+    untouched("error status");
+
+    // The caller gives up part-way.
+    let progressed = Arc::new(tokio::sync::Notify::new());
+    let download = client
+        .download(
+            server
+                .url(&format!("/bytes?len={}&rate={}", 8 * MIB, MIB))
+                .as_str(),
+            &destination,
+        )
+        .unwrap()
+        .progress({
+            let progressed = progressed.clone();
+            move |_, _| progressed.notify_one()
+        })
+        .send();
+    tokio::select! {
+        result = download => panic!("the download finished: {:?}", result),
+        _ = progressed.notified() => {}
+    }
+    // The temporary file's last write may still be on the blocking pool.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while listing(dir.path()).len() > 1 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    untouched("cancellation");
+
+    // Success replaces the content in one step.
+    let response = client
+        .download(
+            server.url("/bytes?len=300000&seed=5").as_str(),
+            &destination,
+        )
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.bytes_downloaded, 300_000);
+    assert_eq!(
+        blake3::hash(&std::fs::read(&destination).unwrap()),
+        server::body_hash(5, 0, 300_000)
+    );
+    assert_eq!(listing(dir.path()), ["artifact.bin"]);
+
+    // A symlink at the destination is replaced, not written through.
+    #[cfg(unix)]
+    {
+        let target = dir.path().join("elsewhere.bin");
+        std::fs::write(&target, PREVIOUS).unwrap();
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        client
+            .download(server.url("/bytes?len=1000&seed=6").as_str(), &link)
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), PREVIOUS);
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap().len(), 1000);
+    }
+}
+
+/// Input that cannot be sent is an error from the builder, never a panic.
+async fn invalid_input_is_an_error(backend: BackendType) {
+    let _serial = SERIAL.lock().await;
+    let server = Server::start().await;
+    let client = client(backend);
+    let url = server.url("/echo");
+
+    for auth in [
+        Auth::custom("x", "a\r\nb"),
+        Auth::bearer("token\ninjected: 1"),
+        Auth::custom("not a token", "x"),
+    ] {
+        assert!(matches!(
+            client.get(url.as_str()).unwrap().auth(auth.clone()),
+            Err(Error::InvalidHeader)
+        ));
+        assert!(matches!(
+            client.upload(url.as_str()).unwrap().auth(auth.clone()),
+            Err(Error::InvalidHeader)
+        ));
+        assert!(matches!(
+            client.download(url.as_str(), "unused").unwrap().auth(auth),
+            Err(Error::InvalidHeader)
+        ));
+    }
+
+    // A header value that is valid but not ASCII goes out as it is.
+    let response = client
+        .upload(url.as_str())
+        .unwrap()
+        .from_data(b"data".to_vec())
+        .header("x-name", "Bjørn")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    let echo: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(echo["headers"]["x-name"], "Bjørn", "{:?}", backend);
+    assert_eq!(echo["body"], "data");
+
+    let dir = temp_dir();
+    let destination = dir.path().join("echo.json");
+    client
+        .download(url.as_str(), &destination)
+        .unwrap()
+        .header("x-name", "Bjørn")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    let echo: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&destination).unwrap()).unwrap();
+    assert_eq!(echo["headers"]["x-name"], "Bjørn", "{:?}", backend);
+}
+
 macro_rules! backend_suite {
     ($module:ident, $backend:expr) => {
         mod $module {
@@ -1111,6 +1858,15 @@ macro_rules! backend_suite {
                 timeouts,
                 small_json_requests,
                 progress_callbacks,
+                redirects_do_not_leak_credentials,
+                redirects_rewrite_methods_and_end,
+                redirect_cookies_stay_with_their_origin,
+                custom_cookie_jar_is_the_active_store,
+                cookies_are_off_unless_asked_for,
+                cookie_accept_policy_is_enforced,
+                file_upload_is_streamed_from_disk,
+                download_replaces_the_destination_only_on_success,
+                invalid_input_is_an_error,
             );
         }
     };
@@ -1139,3 +1895,32 @@ backend_suite!(winhttp, BackendType::Windows);
 
 #[cfg(all(feature = "backend-android", target_os = "android"))]
 backend_suite!(android, BackendType::Android);
+
+/// A jar is tied to a kind of storage, and a backend that cannot use that
+/// kind must say so rather than quietly keep cookies somewhere else.
+#[cfg(all(
+    feature = "backend-foundation",
+    feature = "backend-reqwest",
+    target_vendor = "apple"
+))]
+#[test]
+fn a_jar_the_backend_cannot_use_is_refused() {
+    let jar_for = |backend| {
+        CookieJar::new(frakt::backend::Backend::with_config(backend, Default::default()).unwrap())
+    };
+    for (jar, backend) in [
+        (BackendType::Foundation, BackendType::Reqwest),
+        (BackendType::Reqwest, BackendType::Foundation),
+    ] {
+        let built = Client::builder()
+            .backend(backend)
+            .cookie_jar(jar_for(jar))
+            .build();
+        assert!(
+            built.is_err(),
+            "a {:?} jar was accepted by {:?}",
+            jar,
+            backend
+        );
+    }
+}

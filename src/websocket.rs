@@ -13,7 +13,61 @@
 
 use crate::{Error, Result};
 
-// Backend-specific implementations are in their respective modules
+/// The maximum message size of a connection whose builder was not given
+/// one: 1 MiB, on every backend.
+pub const DEFAULT_MAXIMUM_MESSAGE_SIZE: usize = 1 << 20;
+
+/// What every backend's `connect` does with the builder's limit: a limit of
+/// zero would refuse every message, so it is refused instead.
+#[cfg_attr(
+    not(any(
+        feature = "backend-reqwest",
+        all(feature = "backend-foundation", target_vendor = "apple"),
+        all(feature = "backend-winhttp", windows)
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn checked_maximum_message_size(size: Option<usize>) -> Result<usize> {
+    match size {
+        Some(0) => Err(Error::Internal(
+            "The maximum WebSocket message size must be greater than zero".to_string(),
+        )),
+        Some(size) => Ok(size),
+        None => Ok(DEFAULT_MAXIMUM_MESSAGE_SIZE),
+    }
+}
+
+/// The error for a message of `size` bytes on a connection limited to
+/// `limit`, if it is too large.
+#[cfg_attr(
+    not(any(
+        feature = "backend-reqwest",
+        all(feature = "backend-foundation", target_vendor = "apple"),
+        all(feature = "backend-winhttp", windows)
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn check_message_size(size: usize, limit: usize) -> Result<()> {
+    if size > limit {
+        return Err(Error::WebSocketMessageTooLarge { limit });
+    }
+    Ok(())
+}
+
+impl Message {
+    /// The payload's length in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Message::Text(text) => text.len(),
+            Message::Binary(data) => data.len(),
+        }
+    }
+
+    /// Whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// [`WebSocket`] message types
 #[derive(Debug, Clone)]
@@ -33,6 +87,12 @@ impl From<Vec<u8>> for Message {
 impl From<String> for Message {
     fn from(text: String) -> Self {
         Message::Text(text)
+    }
+}
+
+impl From<&str> for Message {
+    fn from(text: &str) -> Self {
+        Message::Text(text.to_string())
     }
 }
 
@@ -159,6 +219,9 @@ pub enum CloseCode {
 /// # Ok(())
 /// # }
 /// ```
+// One per connection, so the size of the largest variant costs nothing,
+// and a box would put an indirection in front of every send and receive.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum WebSocket {
     /// Foundation backend using NSURLSessionWebSocketTask
@@ -373,47 +436,11 @@ impl WebSocket {
         }
     }
 
-    /// Set the maximum message size for this [`WebSocket`].
+    /// Get the maximum message size.
     ///
-    /// This controls the maximum size of messages that can be sent or received.
-    /// Messages larger than this size will be rejected.
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - The maximum message size in bytes
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use frakt::{Client, Message};
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let client = Client::new()?;
-    /// let mut websocket = client.websocket().connect("wss://echo.websocket.org").await?;
-    ///
-    /// // Set maximum message size to 1MB
-    /// websocket.set_maximum_message_size(1024 * 1024);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn set_maximum_message_size(&mut self, size: isize) {
-        match self {
-            #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
-            WebSocket::Foundation(ws) => ws.set_maximum_message_size(size),
-            #[cfg(all(feature = "backend-winhttp", windows))]
-            WebSocket::Windows(ws) => ws.set_maximum_message_size(size),
-            #[cfg(feature = "backend-reqwest")]
-            WebSocket::Reqwest(ws) => ws.set_maximum_message_size(size),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("No backend available"),
-        }
-    }
-
-    /// Get the current maximum message size.
-    ///
-    /// Returns the maximum size of messages that can be sent or received
-    /// through this [`WebSocket`] connection.
+    /// Returns the maximum size in bytes of a message that can be sent or
+    /// received through this [`WebSocket`] connection. It is fixed when the
+    /// connection is made; see [`WebSocketBuilder::maximum_message_size`].
     ///
     /// # Examples
     ///
@@ -430,7 +457,7 @@ impl WebSocket {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn maximum_message_size(&self) -> isize {
+    pub fn maximum_message_size(&self) -> usize {
         match self {
             #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
             WebSocket::Foundation(ws) => ws.maximum_message_size(),
@@ -485,12 +512,18 @@ pub enum WebSocketBuilder {
 impl WebSocketBuilder {
     /// Set the maximum message size for the [`WebSocket`] connection.
     ///
-    /// This sets the maximum size of messages that can be sent or received
-    /// through the [`WebSocket`] connection. Messages larger than this size will be rejected.
+    /// This sets the maximum size in bytes of a message, after any
+    /// fragments are put back together, that can be sent or received
+    /// through the connection; the default is
+    /// [`DEFAULT_MAXIMUM_MESSAGE_SIZE`]. Sending a larger message fails with
+    /// [`Error::WebSocketMessageTooLarge`] and leaves the connection open.
+    /// Receiving one fails and closes the connection, before the whole
+    /// message has been buffered, so the limit bounds memory use.
     ///
     /// # Arguments
     ///
-    /// * `size` - The maximum message size in bytes
+    /// * `size` - The maximum message size in bytes; `connect` fails if it
+    ///   is zero
     ///
     /// # Examples
     ///
@@ -508,7 +541,7 @@ impl WebSocketBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn maximum_message_size(self, size: isize) -> Self {
+    pub fn maximum_message_size(self, size: usize) -> Self {
         match self {
             #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
             WebSocketBuilder::Foundation(builder) => {

@@ -1,6 +1,6 @@
 //! Debug WebSocket connection issue
 
-use frakt::{BackendType, Client};
+use frakt::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

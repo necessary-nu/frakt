@@ -11,6 +11,10 @@ import java.nio.ByteBuffer;
  * this class from its embedded DEX.
  *
  * Reading is driven from Rust: no callback here calls UrlRequest.read().
+ * Nor does any call UrlRequest.followRedirect(): Rust cancels a redirected
+ * request and sends the next one itself, because Cronet would carry the
+ * headers it was given, the cookies among them, to wherever the redirect
+ * leads.
  */
 public class RustUrlRequestCallback extends UrlRequest.Callback {
     private final long handlerId;

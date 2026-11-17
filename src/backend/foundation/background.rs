@@ -323,10 +323,10 @@ impl BackgroundDelegate {
         let error_status = lock(&state.error_statuses).remove(&task.taskIdentifier());
 
         if lock(&state.cancelled).remove(job) {
-            if let Some(mut waiter) = lock(&state.waiters).remove(job) {
-                if let Some(done) = waiter.done.take() {
-                    let _ = done.send(Err(Error::Cancelled));
-                }
+            if let Some(mut waiter) = lock(&state.waiters).remove(job)
+                && let Some(done) = waiter.done.take()
+            {
+                let _ = done.send(Err(Error::Cancelled));
             }
             return;
         }

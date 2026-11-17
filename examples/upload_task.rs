@@ -4,7 +4,6 @@
 //! with progress tracking.
 
 use frakt::Client;
-use tokio;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,10 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Data upload completed!");
     println!("Status: {}", response2.status());
 
-    if let Ok(json_response) = response2.json::<serde_json::Value>().await {
-        if let Some(data) = json_response.get("data") {
-            println!("Data received by server: {}", data);
-        }
+    if let Ok(json_response) = response2.json::<serde_json::Value>().await
+        && let Some(data) = json_response.get("data")
+    {
+        println!("Data received by server: {}", data);
     }
 
     // Clean up temporary file

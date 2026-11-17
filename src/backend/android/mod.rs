@@ -556,7 +556,9 @@ pub fn test_dns(hostname: &str) -> Result<String> {
 pub struct AndroidBackend {
     pub(crate) jvm: &'static JavaVM,
     cronet_engine: Arc<Global<JObject<'static>>>,
-    cookie_storage: Option<Arc<crate::backend::CookieJar>>,
+    /// The jar requests send from and store into, and the one
+    /// [`cookie_jar`](Self::cookie_jar) hands out; `None` with cookies off.
+    cookie_jar: Option<crate::CookieJar>,
     config: BackendConfig,
 }
 
@@ -568,20 +570,14 @@ impl AndroidBackend {
 
     /// Create a new Android backend with configuration
     pub fn with_config(config: BackendConfig) -> Result<Self> {
+        let cookie_jar = config.cookie_store_jar()?;
         let jvm = get_global_vm()?;
         let cronet_engine = get_global_cronet_engine()?;
-
-        // Create cookie storage if cookies are enabled
-        let cookie_storage = if config.use_cookies.unwrap_or(false) {
-            Some(Arc::new(crate::backend::CookieJar::new()))
-        } else {
-            None
-        };
 
         Ok(Self {
             jvm,
             cronet_engine,
-            cookie_storage,
+            cookie_jar,
             config,
         })
     }
@@ -607,37 +603,26 @@ impl AndroidBackend {
 
         // The engine is shared between clients, so the user agent goes on
         // each request.
-        if let Some(user_agent) = &self.config.user_agent {
-            if let Ok(value) = http::HeaderValue::from_str(user_agent) {
-                request
-                    .headers
-                    .entry(http::header::USER_AGENT)
-                    .or_insert(value);
-            }
+        if let Some(user_agent) = &self.config.user_agent
+            && let Ok(value) = http::HeaderValue::from_str(user_agent)
+        {
+            request
+                .headers
+                .entry(http::header::USER_AGENT)
+                .or_insert(value);
         }
 
-        // Apply cookies from storage if available
-        if let Some(ref cookie_storage) = self.cookie_storage {
-            if let Ok(cookie_headers) = cookie_storage.get_cookies_for_url(&request.url) {
-                for (name, value) in &cookie_headers {
-                    request.headers.entry(name).or_insert(value.clone());
-                }
-            }
-        }
-
-        let response =
-            request::execute_request(self.jvm, &self.cronet_engine, request, read_timeout).await?;
-
-        // Process Set-Cookie headers from redirect responses first
-        if let Some(ref cookie_storage) = self.cookie_storage {
-            for redirect_header_map in &response.redirect_headers {
-                let _ = cookie_storage.process_response_headers(&response.url, redirect_header_map);
-            }
-            // Then process final response headers
-            let _ = cookie_storage.process_response_headers(&response.url, &response.headers);
-        }
-
-        Ok(response)
+        // Cookies are not among these headers: they are added per redirect
+        // hop, for that hop's URL, and never carried from one to the next.
+        let cookies = self.cookie_jar.as_ref().and_then(|jar| jar.cookie_store());
+        request::execute_request(
+            self.jvm,
+            request::Engine(&self.cronet_engine),
+            request,
+            cookies,
+            read_timeout,
+        )
+        .await
     }
 
     /// Download `url` to `file_path` through WorkManager and wait for it;
@@ -648,7 +633,7 @@ impl AndroidBackend {
         file_path: std::path::PathBuf,
         session_identifier: Option<String>,
         headers: http::HeaderMap,
-        progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+        progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
         error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
         background::download_to_file(
@@ -670,8 +655,8 @@ impl AndroidBackend {
         self.config.timeout
     }
 
-    /// Get the cookie jar if configured (not implemented for Android)
+    /// The cookie jar requests use, if cookies are enabled
     pub fn cookie_jar(&self) -> Option<&crate::CookieJar> {
-        None
+        self.cookie_jar.as_ref()
     }
 }

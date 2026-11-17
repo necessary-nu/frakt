@@ -25,13 +25,18 @@ pub struct FoundationWebSocket {
     pub delegate: Retained<crate::backend::foundation::delegate::websocket::WebSocketDelegate>,
     /// Flag to track if connection is closed
     pub closed: bool,
+    max_message_size: usize,
 }
 
 impl FoundationWebSocket {
-    /// Create a new Foundation WebSocket connection
-    pub async fn new(session: Retained<NSURLSession>, url: &str) -> Result<Self> {
-        let nsurl =
-            NSURL::URLWithString(&NSString::from_str(url)).ok_or_else(|| Error::InvalidUrl)?;
+    /// Create a new Foundation WebSocket connection that accepts and sends
+    /// messages of up to `max_message_size` bytes
+    pub async fn new(
+        session: Retained<NSURLSession>,
+        url: &str,
+        max_message_size: usize,
+    ) -> Result<Self> {
+        let nsurl = NSURL::URLWithString(&NSString::from_str(url)).ok_or(Error::InvalidUrl)?;
 
         let (delegate, connection_receiver) =
             crate::backend::foundation::delegate::websocket::WebSocketDelegate::new_with_channel();
@@ -39,6 +44,8 @@ impl FoundationWebSocket {
         let task = session.webSocketTaskWithURL(&nsurl);
 
         task.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
+        // Before the task starts, so no message is read under the default.
+        task.setMaximumMessageSize(isize::try_from(max_message_size).unwrap_or(isize::MAX));
 
         task.resume();
 
@@ -53,6 +60,7 @@ impl FoundationWebSocket {
                     task,
                     delegate,
                     closed: false,
+                    max_message_size,
                 })
             }
             Ok(Err(e)) => {
@@ -72,10 +80,10 @@ impl FoundationWebSocket {
     /// Send a message
     pub async fn send(&mut self, message: Message) -> Result<()> {
         if self.closed {
-            return Err(Error::Internal(
-                "WebSocket connection is closed".to_string(),
-            ));
+            return Err(Error::WebSocketClosed);
         }
+
+        crate::websocket::check_message_size(message.len(), self.max_message_size)?;
 
         let ns_message = match message {
             Message::Text(text) => {
@@ -104,10 +112,10 @@ impl FoundationWebSocket {
             } else {
                 unsafe { Err(Error::from_ns_error(&*error)) }
             };
-            if let Ok(mut tx_guard) = tx.lock() {
-                if let Some(tx) = tx_guard.take() {
-                    let _ = tx.send(result);
-                }
+            if let Ok(mut tx_guard) = tx.lock()
+                && let Some(tx) = tx_guard.take()
+            {
+                let _ = tx.send(result);
             }
         });
 
@@ -123,17 +131,16 @@ impl FoundationWebSocket {
     /// Receive a message
     pub async fn receive(&mut self) -> Result<Message> {
         if self.closed {
-            return Err(Error::Internal(
-                "WebSocket connection is closed".to_string(),
-            ));
+            return Err(Error::WebSocketClosed);
         }
 
+        let limit = self.max_message_size;
         let (tx, rx) = oneshot::channel();
         let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
         let completion_block = block2::RcBlock::new(
             move |message: *mut NSURLSessionWebSocketMessage, error: *mut NSError| {
                 let result = if !error.is_null() {
-                    unsafe { Err(Error::from_ns_error(&*error)) }
+                    unsafe { Err(receive_error(&*error, limit)) }
                 } else if !message.is_null() {
                     unsafe {
                         let msg = &*message;
@@ -165,10 +172,10 @@ impl FoundationWebSocket {
                 } else {
                     Err(Error::Internal("No message or error received".to_string()))
                 };
-                if let Ok(mut tx_guard) = tx.lock() {
-                    if let Some(tx) = tx_guard.take() {
-                        let _ = tx.send(result);
-                    }
+                if let Ok(mut tx_guard) = tx.lock()
+                    && let Some(tx) = tx_guard.take()
+                {
+                    let _ = tx.send(result);
                 }
             },
         );
@@ -178,8 +185,17 @@ impl FoundationWebSocket {
                 .receiveMessageWithCompletionHandler(&completion_block);
         }
 
-        rx.await
-            .map_err(|_| Error::Internal("Receive operation was cancelled".to_string()))?
+        let result = rx
+            .await
+            .map_err(|_| Error::Internal("Receive operation was cancelled".to_string()))?;
+        if matches!(result, Err(Error::WebSocketMessageTooLarge { .. })) {
+            self.task.cancelWithCloseCode_reason(
+                NSURLSessionWebSocketCloseCode(CloseCode::MessageTooBig as isize),
+                None,
+            );
+            self.closed = true;
+        }
+        result
     }
 
     /// Close the WebSocket connection
@@ -215,14 +231,20 @@ impl FoundationWebSocket {
             .map(|data| String::from_utf8_lossy(&data.to_vec()).to_string())
     }
 
-    /// Set the maximum message size for this WebSocket
-    pub fn set_maximum_message_size(&self, size: isize) {
-        self.task.setMaximumMessageSize(size);
+    /// Get the maximum message size, fixed when the connection was made
+    pub fn maximum_message_size(&self) -> usize {
+        self.max_message_size
     }
+}
 
-    /// Get the current maximum message size
-    pub fn maximum_message_size(&self) -> isize {
-        self.task.maximumMessageSize()
+/// NSURLSession fails a receive with POSIX `EMSGSIZE` when the message is
+/// larger than the task's `maximumMessageSize`.
+fn receive_error(error: &NSError, limit: usize) -> Error {
+    if error.domain().to_string() == "NSPOSIXErrorDomain" && error.code() == libc::EMSGSIZE as isize
+    {
+        Error::WebSocketMessageTooLarge { limit }
+    } else {
+        Error::from_ns_error(error)
     }
 }
 
@@ -231,7 +253,7 @@ pub struct FoundationWebSocketBuilder {
     /// The NSURLSession instance to use for the WebSocket connection
     pub session: Retained<NSURLSession>,
     /// Maximum message size for the WebSocket connection
-    pub max_message_size: Option<isize>,
+    pub max_message_size: Option<usize>,
     /// Keeps a backend's session from being invalidated before the task is
     /// created on it.
     owner: Option<std::sync::Arc<super::Session>>,
@@ -256,20 +278,17 @@ impl FoundationWebSocketBuilder {
     }
 
     /// Set the maximum message size for the WebSocket connection
-    pub fn maximum_message_size(mut self, size: isize) -> Self {
+    pub fn maximum_message_size(mut self, size: usize) -> Self {
         self.max_message_size = Some(size);
         self
     }
 
     /// Connect to a WebSocket URL
     pub async fn connect(self, url: &str) -> Result<FoundationWebSocket> {
-        let websocket = FoundationWebSocket::new(self.session, url).await?;
+        let max_message_size =
+            crate::websocket::checked_maximum_message_size(self.max_message_size)?;
+        let websocket = FoundationWebSocket::new(self.session, url, max_message_size).await?;
         drop(self.owner);
-
-        // Set maximum message size if specified
-        if let Some(size) = self.max_message_size {
-            websocket.set_maximum_message_size(size);
-        }
 
         Ok(websocket)
     }

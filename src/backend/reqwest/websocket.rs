@@ -16,70 +16,49 @@ pub struct ReqwestWebSocket {
     pub stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     /// Flag to track if connection is closed
     pub closed: bool,
-    /// Maximum message size for this WebSocket connection
-    pub max_message_size: isize,
+    max_message_size: usize,
 }
 
 impl ReqwestWebSocket {
-    /// Create a new Reqwest WebSocket connection
+    /// Create a new Reqwest WebSocket connection with the default maximum
+    /// message size
     pub async fn new(url: &str) -> Result<Self> {
-        let (stream, _) =
-            tokio_tungstenite::connect_async(url)
-                .await
-                .map_err(|e| Error::Network {
-                    code: -1,
-                    message: format!("WebSocket connection failed: {}", e),
-                })?;
-
-        Ok(Self {
-            stream,
-            closed: false,
-            max_message_size: 1024 * 1024, // Default 1 MB
-        })
+        Self::new_with_config(url, None).await
     }
 
     /// Create a new Reqwest WebSocket connection with configuration
-    pub async fn new_with_config(url: &str, max_message_size: Option<isize>) -> Result<Self> {
+    pub async fn new_with_config(url: &str, max_message_size: Option<usize>) -> Result<Self> {
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-        let config = if let Some(size) = max_message_size {
-            let mut config = WebSocketConfig::default();
-            config.max_message_size = Some(size as usize);
-            Some(config)
-        } else {
-            None
-        };
+        let max_message_size = crate::websocket::checked_maximum_message_size(max_message_size)?;
+        // A frame is part of a message, so the frame limit can be no larger;
+        // left at tungstenite's 16 MiB it would let one frame of a too-large
+        // message be buffered before the message limit is applied.
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(max_message_size))
+            .max_frame_size(Some(max_message_size));
 
-        let (stream, _) = if let Some(config) = config {
-            tokio_tungstenite::connect_async_with_config(url, Some(config), false)
-                .await
-                .map_err(|e| Error::Network {
-                    code: -1,
-                    message: format!("WebSocket connection failed: {}", e),
-                })?
-        } else {
-            tokio_tungstenite::connect_async(url)
-                .await
-                .map_err(|e| Error::Network {
-                    code: -1,
-                    message: format!("WebSocket connection failed: {}", e),
-                })?
-        };
+        let (stream, _) = tokio_tungstenite::connect_async_with_config(url, Some(config), false)
+            .await
+            .map_err(|e| Error::Network {
+                code: -1,
+                message: format!("WebSocket connection failed: {}", e),
+            })?;
 
         Ok(Self {
             stream,
             closed: false,
-            max_message_size: max_message_size.unwrap_or(1024 * 1024),
+            max_message_size,
         })
     }
 
     /// Send a message
     pub async fn send(&mut self, message: Message) -> Result<()> {
         if self.closed {
-            return Err(Error::Internal(
-                "WebSocket connection is closed".to_string(),
-            ));
+            return Err(Error::WebSocketClosed);
         }
+
+        crate::websocket::check_message_size(message.len(), self.max_message_size)?;
 
         let tungstenite_message = match message {
             Message::Text(text) => tungstenite::Message::Text(text.into()),
@@ -98,9 +77,7 @@ impl ReqwestWebSocket {
     /// Receive a message
     pub async fn receive(&mut self) -> Result<Message> {
         if self.closed {
-            return Err(Error::Internal(
-                "WebSocket connection is closed".to_string(),
-            ));
+            return Err(Error::WebSocketClosed);
         }
 
         loop {
@@ -113,9 +90,7 @@ impl ReqwestWebSocket {
                 }
                 Some(Ok(tungstenite::Message::Close(_))) => {
                     self.closed = true;
-                    return Err(Error::Internal(
-                        "WebSocket connection closed by server".to_string(),
-                    ));
+                    return Err(Error::WebSocketClosed);
                 }
                 Some(Ok(tungstenite::Message::Ping(_))) => {
                     // Pings are automatically handled by tungstenite
@@ -129,6 +104,14 @@ impl ReqwestWebSocket {
                     // Raw frames are not exposed at this level
                     continue;
                 }
+                Some(Err(tungstenite::Error::Capacity(
+                    tungstenite::error::CapacityError::MessageTooLong { .. },
+                ))) => {
+                    self.closed = true;
+                    return Err(Error::WebSocketMessageTooLarge {
+                        limit: self.max_message_size,
+                    });
+                }
                 Some(Err(e)) => {
                     self.closed = true;
                     return Err(Error::Network {
@@ -138,7 +121,7 @@ impl ReqwestWebSocket {
                 }
                 None => {
                     self.closed = true;
-                    return Err(Error::Internal("WebSocket stream ended".to_string()));
+                    return Err(Error::WebSocketClosed);
                 }
             }
         }
@@ -184,13 +167,8 @@ impl ReqwestWebSocket {
         }
     }
 
-    /// Set the maximum message size for this WebSocket
-    pub fn set_maximum_message_size(&mut self, size: isize) {
-        self.max_message_size = size;
-    }
-
-    /// Get the current maximum message size
-    pub fn maximum_message_size(&self) -> isize {
+    /// Get the maximum message size, fixed when the connection was made
+    pub fn maximum_message_size(&self) -> usize {
         self.max_message_size
     }
 }
@@ -198,7 +176,13 @@ impl ReqwestWebSocket {
 /// Reqwest WebSocket builder
 pub struct ReqwestWebSocketBuilder {
     /// Maximum message size for the WebSocket connection
-    pub max_message_size: Option<isize>,
+    pub max_message_size: Option<usize>,
+}
+
+impl Default for ReqwestWebSocketBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReqwestWebSocketBuilder {
@@ -210,7 +194,7 @@ impl ReqwestWebSocketBuilder {
     }
 
     /// Set the maximum message size for the WebSocket connection
-    pub fn maximum_message_size(mut self, size: isize) -> Self {
+    pub fn maximum_message_size(mut self, size: usize) -> Self {
         self.max_message_size = Some(size);
         self
     }

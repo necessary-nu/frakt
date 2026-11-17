@@ -30,7 +30,6 @@ use crate::backend::Backend;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct DownloadResponse {
     /// Path where the file was saved
     pub file_path: std::path::PathBuf,
@@ -40,6 +39,84 @@ pub struct DownloadResponse {
     pub status: StatusCode,
     /// HTTP headers from the response
     pub headers: HeaderMap,
+}
+
+/// `Set-Cookie` and other credential-bearing header values are not shown.
+impl std::fmt::Debug for DownloadResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadResponse")
+            .field("file_path", &self.file_path)
+            .field("bytes_downloaded", &self.bytes_downloaded)
+            .field("status", &self.status)
+            .field("headers", &crate::redact::RedactedHeaders(&self.headers))
+            .finish()
+    }
+}
+
+/// A download in progress: a uniquely named file beside the destination,
+/// renamed over it only once the whole body has been written. If it is
+/// dropped before that, because the transfer failed or the download's future
+/// was cancelled, the file is removed and the destination is as it was.
+struct PendingFile {
+    file: tokio::fs::File,
+    path: tempfile::TempPath,
+}
+
+impl PendingFile {
+    fn create(destination: &std::path::Path) -> std::io::Result<Self> {
+        let directory = match destination.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => std::path::Path::new("."),
+        };
+        let name = destination.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} does not name a file", destination.display()),
+            )
+        })?;
+        let mut prefix = std::ffi::OsString::from(".");
+        prefix.push(name);
+        prefix.push(".");
+
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix).suffix(".frakt-download");
+        // What `File::create` would give the destination: the umask applies.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+        let pending = builder.tempfile_in(directory)?;
+
+        // Replacing a file keeps its permissions, as truncating it did.
+        if let Ok(existing) = std::fs::metadata(destination)
+            && existing.is_file()
+        {
+            pending.as_file().set_permissions(existing.permissions())?;
+        }
+
+        let (file, path) = pending.into_parts();
+        Ok(Self {
+            file: tokio::fs::File::from_std(file),
+            path,
+        })
+    }
+
+    async fn write(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        tokio::io::AsyncWriteExt::write_all(&mut self.file, chunk).await
+    }
+
+    /// Put the finished file at `destination`, replacing what is there. A
+    /// symlink at the destination is replaced, not followed.
+    async fn publish(mut self, destination: &std::path::Path) -> std::io::Result<()> {
+        tokio::io::AsyncWriteExt::flush(&mut self.file).await?;
+        // Closed before the rename: Windows does not rename an open file.
+        drop(self.file.into_std().await);
+
+        let path = self.path;
+        let destination = destination.to_path_buf();
+        tokio::task::spawn_blocking(move || path.persist(destination))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|error| error.error)
+    }
 }
 
 /// Builder for downloading files from URLs to local disk.
@@ -119,7 +196,7 @@ pub struct DownloadBuilder {
     url: Url,
     file_path: Option<std::path::PathBuf>,
     headers: HeaderMap,
-    progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+    progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
     error_for_status: bool,
     require_checked_body: bool,
 }
@@ -136,6 +213,23 @@ impl DownloadBuilder {
             error_for_status: true,
             require_checked_body: false,
         }
+    }
+
+    /// Replace the request's headers.
+    #[cfg_attr(not(all(feature = "backend-winhttp", windows)), allow(dead_code))]
+    pub(crate) fn headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// [`progress`](Self::progress) for a callback that is already boxed.
+    #[cfg_attr(not(all(feature = "backend-winhttp", windows)), allow(dead_code))]
+    pub(crate) fn progress_callback(
+        mut self,
+        callback: Option<crate::backend::types::BoxedProgressCallback>,
+    ) -> Self {
+        self.progress_callback = callback;
+        self
     }
 
     /// Refuse a response whose body could be cut short without an error;
@@ -336,19 +430,23 @@ impl DownloadBuilder {
     /// # }
     /// ```
     pub fn auth(mut self, auth: crate::Auth) -> crate::Result<Self> {
-        let header_value = http::HeaderValue::from_str(&auth.to_header_value())
-            .map_err(|_| crate::Error::InvalidHeader)?;
         self.headers
-            .insert(http::header::AUTHORIZATION, header_value);
+            .insert(http::header::AUTHORIZATION, auth.header_value()?);
         Ok(self)
     }
 
     /// Execute the download and save the file to disk.
     ///
-    /// This method performs the actual download, streaming the content directly
-    /// to the specified file path. The download is performed asynchronously and
-    /// efficiently handles large files by streaming rather than loading everything
-    /// into memory.
+    /// This method performs the actual download, streaming the content to
+    /// disk rather than loading it into memory. The body is written to a
+    /// temporary file in the destination's directory, which replaces the
+    /// destination in one rename once the whole body has arrived. Until
+    /// then, and if the download fails, times out or its future is dropped,
+    /// a file already at the destination is left exactly as it was and no
+    /// partial file appears under the destination's name. A symlink at the
+    /// destination is replaced rather than followed. The rename is atomic;
+    /// the data is not forced to stable storage first, so call
+    /// `File::sync_all` on the result if it must survive a power failure.
     ///
     /// # Returns
     ///
@@ -400,66 +498,45 @@ impl DownloadBuilder {
             })?;
         }
 
-        // Create request - disable error checking since we handle it ourselves
+        // Status errors are checked here, where the builder's setting is.
         let mut request_builder =
             crate::RequestBuilder::new(http::Method::GET, self.url, self.backend)
-                .allow_error_status();
+                .allow_error_status()
+                .headers(self.headers);
         if self.require_checked_body {
             request_builder = request_builder.require_checked_body();
         }
 
-        // Add headers to the request
-        for (name, value) in &self.headers {
-            request_builder = request_builder.header(
-                name.as_str(),
-                value.to_str().map_err(|_| crate::Error::InvalidHeader)?,
-            )?;
-        }
-
         let response = request_builder.send().await?;
 
-        // Capture status and headers before consuming response
         let status = response.status();
         let headers = response.headers().clone();
 
-        // Check for HTTP error status if enabled
         if error_for_status && status.as_u16() >= 400 {
             return Err(crate::Error::HttpError(Box::new(response)));
         }
 
-        // Get content length for progress callback before consuming response
-        let total_bytes = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+        // The announced length counts encoded bytes, so it is only the
+        // total when the body is delivered as it was sent.
+        let total_bytes = response
+            .expected_wire_length()
+            .filter(|_| !response.is_decoded());
 
-        // Open file for writing
-        let mut file = tokio::fs::File::create(&file_path)
-            .await
-            .map_err(|e| crate::Error::Internal(format!("Failed to create file: {}", e)))?;
-
+        let mut pending = PendingFile::create(&file_path)?;
         let mut stream = response.stream();
         let mut bytes_downloaded = 0u64;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
             bytes_downloaded += chunk.len() as u64;
+            pending.write(&chunk).await?;
 
-            // Write chunk to file
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-                .await
-                .map_err(|e| crate::Error::Internal(format!("Failed to write to file: {}", e)))?;
-
-            // Call progress callback if provided
             if let Some(ref callback) = self.progress_callback {
                 callback(bytes_downloaded, total_bytes);
             }
         }
 
-        // Ensure file is flushed
-        tokio::io::AsyncWriteExt::flush(&mut file)
-            .await
-            .map_err(|e| crate::Error::Internal(format!("Failed to flush file: {}", e)))?;
+        pending.publish(&file_path).await?;
 
         Ok(DownloadResponse {
             file_path,

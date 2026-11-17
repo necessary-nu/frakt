@@ -12,7 +12,7 @@ High-performance, async-first HTTP client for Rust. Cross-platform with native b
 - **All HTTP methods** - GET, POST, PUT, DELETE, PATCH, HEAD
 - **WebSocket support** - NSURLSessionWebSocketTask/WinHTTP integration
 - **File operations** - Uploads/downloads with progress tracking
-- **Background sessions** - Downloads that survive app suspension (iOS)
+- **Background downloads** - Downloads that survive app suspension (iOS), and resumable downloads that can outlive the program (Reqwest on Unix)
 - **Cookie management** - NSHTTPCookieStorage/cookie_store integration
 - **Proxy configuration** - HTTP/HTTPS/SOCKS proxy support
 - **Authentication** - Basic, Bearer, and Custom authentication
@@ -93,14 +93,14 @@ use frakt::Auth;
 // Basic authentication
 let response = client
     .get("https://api.example.com/protected")?
-    .auth(Auth::basic("user", "pass"))
+    .auth(Auth::basic("user", "pass"))?
     .send()
     .await?;
 
 // Bearer token
 let response = client
     .get("https://api.example.com/protected")?
-    .auth(Auth::bearer("your-token"))
+    .auth(Auth::bearer("your-token"))?
     .send()
     .await?;
 ```
@@ -129,6 +129,40 @@ client
     .send()
     .await?;
 ```
+
+### Background Downloads
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reqwest backend on Unix: lets downloads carry on in a helper process
+    // after this program exits. Does nothing elsewhere.
+    frakt::enable_background_helper();
+
+    let client = frakt::Client::new()?;
+    let response = client
+        .download_background("https://example.com/large-file.zip", "./downloads/file.zip")?
+        .send()
+        .await?;
+    println!("{} bytes, status {}", response.bytes_downloaded, response.status);
+    Ok(())
+}
+```
+
+On Apple platforms this is an NSURLSession background download. With the
+Reqwest backend it is a resumable download:
+
+- The body is written to `file.zip.frakt-partial` next to the destination,
+  with `file.zip.frakt-partial.meta` describing it. The destination is
+  replaced in one step when the download is complete, and is left as it was
+  if the download fails.
+- A later download of the same URL to the same destination carries on from
+  the partial file if the server confirms, by ETag or Last-Modified, that the
+  content has not changed. Otherwise it starts again from the beginning.
+- The download runs in the task that awaits it. On Unix, a program that
+  calls `frakt::enable_background_helper()` at the top of `main` gets a
+  detached helper process for each download instead: the program's own
+  executable, started again. It keeps downloading after the program exits.
 
 ### WebSocket
 
@@ -207,7 +241,7 @@ Run examples with `cargo run --example <name>`:
 - **`streaming`** - Streaming large responses with AsyncRead
 - **`upload_task`** - Upload tasks with progress tracking
 - **`websocket`** - WebSocket client usage
-- **`background_download`** - Background downloads (iOS)
+- **`background_download`** - Background downloads
 
 ## Architecture
 

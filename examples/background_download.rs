@@ -5,10 +5,15 @@
 //! session identifier.
 
 use frakt::Client;
-use tokio;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // On the reqwest backend this lets the download carry on in a helper
+    // process if this one exits. It has to come before everything else: the
+    // helper is this program started again, and returns from this call only
+    // when it is not the helper.
+    frakt::enable_background_helper();
+
     println!("Starting background download example...");
 
     // Create a client
@@ -26,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create background download with required session identifier
     let response = client
-        .download_background(url, &download_path)
+        .download_background(url, &download_path)?
         .session_identifier("com.example.frakt.background")
         .progress(|bytes_downloaded, total_bytes| {
             if let Some(total) = total_bytes {

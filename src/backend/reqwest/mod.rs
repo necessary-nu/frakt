@@ -1,73 +1,92 @@
 //! Reqwest backend for cross-platform HTTP support
 
 mod background;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "android"
+    ))
+))]
+mod helper;
 
 pub mod websocket;
 pub use websocket::{ReqwestWebSocket, ReqwestWebSocketBuilder};
 
+use crate::backend::redirect;
 use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting, ProgressCallback};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::Stream;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Sleep;
 use url::Url;
 
-/// A stream that tracks upload progress as data is consumed
-struct ProgressTrackingStream {
+/// An in-memory body as a stream of chunks, so that progress can be
+/// reported as hyper takes them.
+fn bytes_chunks(
     data: Bytes,
-    position: usize,
-    total: u64,
-    uploaded: Arc<AtomicU64>,
-    callback: Arc<ProgressCallback>,
     chunk_size: usize,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    futures_util::stream::unfold(data, move |mut rest| async move {
+        if rest.is_empty() {
+            return None;
+        }
+        let chunk = rest.split_to(chunk_size.min(rest.len()));
+        Some((Ok(chunk), rest))
+    })
 }
 
-impl ProgressTrackingStream {
-    fn new(data: Bytes, callback: ProgressCallback, chunk_size: usize) -> Self {
-        let total = data.len() as u64;
-        let uploaded = Arc::new(AtomicU64::new(0));
+/// A request body that reports each chunk to the progress callback as hyper
+/// takes it for the wire, which is as near to the network as reqwest lets a
+/// caller see.
+fn progress_body(
+    chunks: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    total: u64,
+    callback: Option<ProgressCallback>,
+) -> reqwest::Body {
+    use futures_util::StreamExt;
 
-        // Call progress callback at start
+    if let Some(callback) = &callback {
         callback(0, Some(total));
-
-        Self {
-            data,
-            position: 0,
-            total,
-            uploaded,
-            callback: Arc::new(callback),
-            chunk_size,
-        }
     }
+    let mut sent = 0u64;
+    reqwest::Body::wrap_stream(chunks.inspect(move |chunk| {
+        if let (Ok(chunk), Some(callback)) = (chunk, &callback) {
+            sent += chunk.len() as u64;
+            callback(sent, Some(total));
+        }
+    }))
 }
 
-impl Stream for ProgressTrackingStream {
-    type Item = std::result::Result<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+tokio::task_local! {
+    /// The URL the caller asked for, set while a request is being sent.
+    /// reqwest tells its cookie provider only which hop set a cookie, and
+    /// the accept policy needs to know where the chain started.
+    static MAIN_DOCUMENT: Url;
+}
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let remaining = self.data.len() - self.position;
-        if remaining == 0 {
-            return Poll::Ready(None);
-        }
+/// frakt's cookie jar as reqwest's cookie provider, so the jar the caller
+/// holds is the one requests send from and store into.
+struct JarProvider(crate::backend::CookieJar);
 
-        let chunk_size = std::cmp::min(self.chunk_size, remaining);
-        let chunk = self.data.slice(self.position..self.position + chunk_size);
-        self.position += chunk_size;
+impl reqwest::cookie::CookieStore for JarProvider {
+    fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &http::HeaderValue>, url: &Url) {
+        let main_document = MAIN_DOCUMENT.try_with(Url::clone).ok();
+        self.0
+            .store_set_cookies(main_document.as_ref(), url, cookie_headers);
+    }
 
-        // Update progress
-        let uploaded = self
-            .uploaded
-            .fetch_add(chunk_size as u64, Ordering::Relaxed)
-            + chunk_size as u64;
-        (self.callback)(uploaded, Some(self.total));
-
-        Poll::Ready(Some(Ok(chunk)))
+    fn cookies(&self, url: &Url) -> Option<http::HeaderValue> {
+        self.0.cookie_header(url)
     }
 }
 
@@ -200,11 +219,88 @@ fn map_decode_error(error: std::io::Error) -> Error {
 
 fn body_content_type(body: &crate::body::Body) -> Option<&str> {
     match body {
-        crate::body::Body::Bytes { content_type, .. } => Some(content_type),
+        crate::body::Body::Bytes { content_type, .. }
+        | crate::body::Body::File { content_type, .. } => Some(content_type),
         crate::body::Body::Form { .. } => Some("application/x-www-form-urlencoded"),
         crate::body::Body::Json { .. } => Some("application/json"),
         crate::body::Body::Empty | crate::body::Body::Multipart { .. } => None,
     }
+}
+
+/// Send a request and follow its redirects by frakt's own policy.
+///
+/// The client is built to follow none itself: reqwest keeps headers it does
+/// not know to be credentials, such as an API key, when a redirect changes
+/// origin, and cannot send a streamed body a second time. `request` builds
+/// the reqwest request for each hop, with the body only if it is told to.
+/// `read_timeout` bounds the wait for each hop's response to start.
+pub(crate) async fn follow_redirects(
+    mut method: http::Method,
+    mut url: Url,
+    mut headers: http::HeaderMap,
+    read_timeout: Option<Duration>,
+    mut request: impl FnMut(
+        http::Method,
+        Url,
+        &http::HeaderMap,
+        bool,
+    ) -> Result<reqwest::RequestBuilder>,
+) -> Result<reqwest::Response> {
+    let main_document = url.clone();
+    let mut with_body = true;
+    let mut redirects = 0;
+
+    loop {
+        let send = MAIN_DOCUMENT.scope(
+            main_document.clone(),
+            request(method.clone(), url.clone(), &headers, with_body)?.send(),
+        );
+        let response = match read_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send)
+                .await
+                .map_err(|_| Error::Timeout)?,
+            None => send.await,
+        }
+        .map_err(map_reqwest_error)?;
+
+        let Some(hop) = redirect::next_hop(
+            &method,
+            &url,
+            &headers,
+            response.status(),
+            response.headers(),
+        ) else {
+            return Ok(response);
+        };
+        redirects += 1;
+        if redirects > redirect::MAX_REDIRECTS {
+            return Err(redirect::too_many_redirects());
+        }
+        with_body &= hop.keep_body;
+        (method, url, headers) = (hop.method, hop.url, hop.headers);
+    }
+}
+
+/// How much of an upload is read and handed to hyper at a time.
+const UPLOAD_CHUNK: usize = 64 * 1024;
+
+/// The encoded bytes of a body that is sent from memory.
+fn body_to_bytes(body: &crate::body::Body) -> Result<Bytes> {
+    Ok(match body {
+        crate::body::Body::Bytes { content, .. } => content.clone(),
+        crate::body::Body::Form { fields } => fields
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into(),
+        crate::body::Body::Json { value } => serde_json::to_vec(value)
+            .map_err(|e| Error::Json(e.to_string()))?
+            .into(),
+        crate::body::Body::Empty
+        | crate::body::Body::Multipart { .. }
+        | crate::body::Body::File { .. } => Bytes::new(),
+    })
 }
 
 /// Classify a reqwest error as timeout, TLS or other network failure.
@@ -347,13 +443,156 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
     }
 }
 
+/// The plain data a `reqwest::Client` is built from, kept by the backend so
+/// the background download helper process can build an equivalent client.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ClientSettings {
+    user_agent: Option<String>,
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    ignore_certificate_errors: bool,
+    default_headers: Vec<(String, Vec<u8>)>,
+    use_cookies: bool,
+    http_proxy: Option<ProxySettings>,
+    https_proxy: Option<ProxySettings>,
+    socks_proxy: Option<ProxySettings>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProxySettings {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl ProxySettings {
+    /// The proxy at `scheme://host:port` for the traffic `intercept` selects.
+    fn build(
+        &self,
+        scheme: &str,
+        name: &str,
+        intercept: fn(&str) -> reqwest::Result<reqwest::Proxy>,
+    ) -> Result<reqwest::Proxy> {
+        let url = format!("{}://{}:{}", scheme, self.host, self.port);
+        let proxy = intercept(&url)
+            .map_err(|e| Error::Internal(format!("Invalid {} proxy: {}", name, e)))?;
+        Ok(match (&self.username, &self.password) {
+            (Some(username), Some(password)) => proxy.basic_auth(username, password),
+            _ => proxy,
+        })
+    }
+}
+
+impl ClientSettings {
+    fn from_config(config: &crate::backend::BackendConfig) -> Self {
+        let proxy = |proxy: &crate::client::ProxyConfig| ProxySettings {
+            host: proxy.host.clone(),
+            port: proxy.port,
+            username: proxy.username.clone(),
+            password: proxy.password.clone(),
+        };
+        Self {
+            user_agent: config.user_agent.clone(),
+            connect_timeout: config.connect_timeout,
+            read_timeout: config.read_timeout,
+            ignore_certificate_errors: config.ignore_certificate_errors.unwrap_or(false),
+            default_headers: config
+                .default_headers
+                .iter()
+                .flatten()
+                .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+                .collect(),
+            use_cookies: config.cookies_enabled(),
+            http_proxy: config.http_proxy.as_ref().map(proxy),
+            https_proxy: config.https_proxy.as_ref().map(proxy),
+            socks_proxy: config.socks_proxy.as_ref().map(proxy),
+        }
+    }
+}
+
+/// The client `settings` describe. With `jar`, the client sends from and
+/// stores into that jar; without one, as in the helper process, cookies are
+/// kept only for the life of the client, so that one set along a redirect
+/// chain reaches the later hops.
+fn build_client(
+    settings: &ClientSettings,
+    jar: Option<&crate::backend::CookieJar>,
+) -> Result<reqwest::Client> {
+    // `follow_redirects` follows them instead.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+
+    // reqwest's own `timeout` is a total deadline and its `read_timeout`
+    // cannot be overridden per request, so both are enforced by the backend
+    // instead.
+    if let Some(timeout) = settings.connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+
+    if let Some(user_agent) = &settings.user_agent {
+        builder = builder.user_agent(user_agent);
+    }
+
+    builder = builder.tls_backend_preconfigured(tls_config(settings.ignore_certificate_errors)?);
+
+    if !settings.default_headers.is_empty() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in &settings.default_headers {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_bytes(value),
+            ) {
+                headers.append(name, value);
+            }
+        }
+        builder = builder.default_headers(headers);
+    }
+
+    match jar {
+        Some(jar) => builder = builder.cookie_provider(Arc::new(JarProvider(jar.clone()))),
+        None if settings.use_cookies => builder = builder.cookie_store(true),
+        None => {}
+    }
+
+    if let Some(proxy) = &settings.http_proxy {
+        builder = builder.proxy(proxy.build("http", "HTTP", |url| reqwest::Proxy::http(url))?);
+    }
+    if let Some(proxy) = &settings.https_proxy {
+        builder = builder.proxy(proxy.build("https", "HTTPS", |url| reqwest::Proxy::https(url))?);
+    }
+    if let Some(proxy) = &settings.socks_proxy {
+        builder = builder.proxy(proxy.build("socks5", "SOCKS", |url| reqwest::Proxy::all(url))?);
+    }
+
+    builder
+        .build()
+        .map_err(|e| Error::Internal(format!("Failed to create reqwest client: {}", e)))
+}
+
+/// What [`enable_background_helper`](crate::enable_background_helper) does
+/// for this backend.
+pub(crate) fn enable_background_helper() {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "android"
+        ))
+    ))]
+    helper::enable();
+}
+
 /// Reqwest backend for cross-platform HTTP
 #[derive(Clone)]
 pub struct ReqwestBackend {
     client: reqwest::Client,
     cookie_jar: Option<crate::CookieJar>,
     default_headers: Option<http::HeaderMap>,
-    read_timeout: Option<Duration>,
+    /// Shared, as the backend is cloned for every request.
+    settings: Arc<ClientSettings>,
     total_timeout: Option<Duration>,
 }
 
@@ -365,95 +604,18 @@ impl ReqwestBackend {
 
     /// Create a new Reqwest backend with configuration
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
-        let mut builder = reqwest::Client::builder();
-
-        // reqwest's own `timeout` is a total deadline and its `read_timeout`
-        // cannot be overridden per request, so both are enforced here instead.
-        if let Some(timeout) = config.connect_timeout {
-            builder = builder.connect_timeout(timeout);
-        }
-
-        // Apply user agent configuration
-        if let Some(user_agent) = config.user_agent {
-            builder = builder.user_agent(user_agent);
-        }
-
-        builder = builder.tls_backend_preconfigured(tls_config(
-            config.ignore_certificate_errors.unwrap_or(false),
-        )?);
-
-        // Apply default headers
-        if let Some(default_headers) = config.default_headers.clone() {
-            // Convert http::HeaderMap to reqwest::header::HeaderMap
-            let mut reqwest_headers = reqwest::header::HeaderMap::new();
-            for (name, value) in default_headers {
-                if let Some(name) = name {
-                    if let Ok(reqwest_name) =
-                        reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
-                    {
-                        if let Ok(reqwest_value) =
-                            reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-                        {
-                            reqwest_headers.insert(reqwest_name, reqwest_value);
-                        }
-                    }
-                }
-            }
-            builder = builder.default_headers(reqwest_headers);
-        }
-
-        // Apply cookie configuration
-        if let Some(use_cookies) = config.use_cookies {
-            if use_cookies {
-                builder = builder.cookie_store(true);
-            }
-        }
-
-        // Apply proxy configurations
-        if let Some(http_proxy) = config.http_proxy {
-            let proxy_url = format!("http://{}:{}", http_proxy.host, http_proxy.port);
-            let mut proxy = reqwest::Proxy::http(&proxy_url)
-                .map_err(|e| Error::Internal(format!("Invalid HTTP proxy: {}", e)))?;
-
-            if let (Some(username), Some(password)) = (&http_proxy.username, &http_proxy.password) {
-                proxy = proxy.basic_auth(username, password);
-            }
-            builder = builder.proxy(proxy);
-        }
-
-        if let Some(https_proxy) = config.https_proxy {
-            let proxy_url = format!("https://{}:{}", https_proxy.host, https_proxy.port);
-            let mut proxy = reqwest::Proxy::https(&proxy_url)
-                .map_err(|e| Error::Internal(format!("Invalid HTTPS proxy: {}", e)))?;
-
-            if let (Some(username), Some(password)) = (&https_proxy.username, &https_proxy.password)
-            {
-                proxy = proxy.basic_auth(username, password);
-            }
-            builder = builder.proxy(proxy);
-        }
-
-        if let Some(socks_proxy) = config.socks_proxy {
-            let proxy_url = format!("socks5://{}:{}", socks_proxy.host, socks_proxy.port);
-            let mut proxy = reqwest::Proxy::all(&proxy_url)
-                .map_err(|e| Error::Internal(format!("Invalid SOCKS proxy: {}", e)))?;
-
-            if let (Some(username), Some(password)) = (&socks_proxy.username, &socks_proxy.password)
-            {
-                proxy = proxy.basic_auth(username, password);
-            }
-            builder = builder.proxy(proxy);
-        }
-
-        let client = builder
-            .build()
-            .map_err(|e| Error::Internal(format!("Failed to create reqwest client: {}", e)))?;
+        let cookie_jar = config.cookie_store_jar()?;
+        let settings = ClientSettings::from_config(&config);
+        let client = build_client(
+            &settings,
+            cookie_jar.as_ref().and_then(|jar| jar.cookie_store()),
+        )?;
 
         Ok(Self {
             client,
-            cookie_jar: config.cookie_jar,
+            cookie_jar,
             default_headers: config.default_headers,
-            read_timeout: config.read_timeout,
+            settings: Arc::new(settings),
             total_timeout: config.timeout,
         })
     }
@@ -468,7 +630,6 @@ impl ReqwestBackend {
 
     /// Execute an HTTP request using reqwest
     pub async fn execute(&self, request: BackendRequest) -> Result<BackendResponse> {
-        // Validate URL scheme
         match request.url.scheme() {
             "http" | "https" => {}
             _ => {
@@ -476,76 +637,23 @@ impl ReqwestBackend {
             }
         }
 
-        // Build request
-        let read_timeout = request.read_timeout.or(self.read_timeout);
-        let mut req_builder = self.client.request(request.method, request.url);
-        let chosen =
-            |headers: &http::HeaderMap| headers.contains_key(http::header::ACCEPT_ENCODING);
-        if !chosen(&request.headers) && !self.default_headers.as_ref().is_some_and(chosen) {
-            req_builder = req_builder.header(http::header::ACCEPT_ENCODING, ACCEPT_ENCODING);
-        }
-
-        // Add headers
-        for (name, value) in &request.headers {
-            req_builder = req_builder.header(name, value);
-        }
-
-        // Add body
-        if let Some(body) = request.body {
-            match &body {
-                crate::body::Body::Multipart { parts } => {
-                    let mut form = reqwest::multipart::Form::new();
-                    for part in parts {
-                        let mut part_builder =
-                            reqwest::multipart::Part::bytes(part.content.to_vec());
-
-                        if let Some(filename) = &part.filename {
-                            part_builder = part_builder.file_name(filename.clone());
-                        }
-
-                        if let Some(content_type) = &part.content_type {
-                            part_builder = part_builder.mime_str(content_type).map_err(|e| {
-                                Error::Internal(format!("Invalid content type: {}", e))
-                            })?;
-                        }
-
-                        form = form.part(part.name.clone(), part_builder);
-                    }
-                    req_builder = req_builder.multipart(form);
-                }
-                _ => {
-                    if let Some(content_type) = body_content_type(&body) {
-                        if !request.headers.contains_key(http::header::CONTENT_TYPE) {
-                            req_builder =
-                                req_builder.header(http::header::CONTENT_TYPE, content_type);
-                        }
-                    }
-                    let bytes = self.body_to_bytes(&body)?;
-                    if let Some(callback) = &request.progress_callback {
-                        // A wrapped stream has no length, and hyper would
-                        // otherwise send it chunked.
-                        req_builder = req_builder
-                            .header(http::header::CONTENT_LENGTH, bytes.len())
-                            .body(reqwest::Body::wrap_stream(ProgressTrackingStream::new(
-                                bytes,
-                                callback.clone(),
-                                64 * 1024,
-                            )));
-                    } else {
-                        req_builder = req_builder.body(bytes);
-                    }
-                }
-            }
-        }
-
-        let send = req_builder.send();
-        let response = match read_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, send)
-                .await
-                .map_err(|_| Error::Timeout)?,
-            None => send.await,
-        }
-        .map_err(map_reqwest_error)?;
+        let read_timeout = request.read_timeout.or(self.settings.read_timeout);
+        let response = follow_redirects(
+            request.method,
+            request.url,
+            request.headers,
+            read_timeout,
+            |method, url, headers, with_body| {
+                self.request_builder(
+                    method,
+                    url,
+                    headers,
+                    request.body.as_ref().filter(|_| with_body),
+                    request.progress_callback.as_ref(),
+                )
+            },
+        )
+        .await?;
 
         let headers = response.headers().clone();
         let coding = decodable_coding(&headers);
@@ -564,32 +672,93 @@ impl ReqwestBackend {
             }),
             headers,
             accounting,
-            redirect_headers: vec![],
         })
     }
 
-    fn body_to_bytes(&self, body: &crate::body::Body) -> Result<Bytes> {
-        match body {
-            crate::body::Body::Empty => Ok(Bytes::from("")),
-            crate::body::Body::Bytes { content, .. } => Ok(Bytes::from(content.clone())),
-            crate::body::Body::Form { fields } => {
-                let form_data = fields
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-                    .collect::<Vec<_>>()
-                    .join("&");
-                Ok(Bytes::from(form_data))
-            }
-            crate::body::Body::Json { value } => {
-                let json_bytes =
-                    serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?;
-                Ok(Bytes::from(json_bytes))
-            }
-            crate::body::Body::Multipart { .. } => {
-                // Multipart is handled separately in the execute function
-                Ok(Bytes::from(""))
-            }
+    /// The reqwest request for one hop.
+    fn request_builder(
+        &self,
+        method: http::Method,
+        url: Url,
+        headers: &http::HeaderMap,
+        body: Option<&crate::body::Body>,
+        progress_callback: Option<&ProgressCallback>,
+    ) -> Result<reqwest::RequestBuilder> {
+        let mut req_builder = self.client.request(method, url);
+        let chosen =
+            |headers: &http::HeaderMap| headers.contains_key(http::header::ACCEPT_ENCODING);
+        if !chosen(headers) && !self.default_headers.as_ref().is_some_and(chosen) {
+            req_builder = req_builder.header(http::header::ACCEPT_ENCODING, ACCEPT_ENCODING);
         }
+
+        for (name, value) in headers {
+            req_builder = req_builder.header(name, value);
+        }
+
+        let Some(body) = body else {
+            return Ok(req_builder);
+        };
+        if let Some(content_type) = body_content_type(body)
+            && !headers.contains_key(http::header::CONTENT_TYPE)
+        {
+            req_builder = req_builder.header(http::header::CONTENT_TYPE, content_type);
+        }
+
+        // A wrapped stream has no length, and hyper would otherwise send it
+        // chunked.
+        let streamed = |req_builder: reqwest::RequestBuilder, total: u64, body: reqwest::Body| {
+            req_builder
+                .header(http::header::CONTENT_LENGTH, total)
+                .body(body)
+        };
+        Ok(match body {
+            crate::body::Body::Multipart { parts } => {
+                let mut form = reqwest::multipart::Form::new();
+                for part in parts {
+                    let mut part_builder = reqwest::multipart::Part::stream(part.content.clone());
+
+                    if let Some(filename) = &part.filename {
+                        part_builder = part_builder.file_name(filename.clone());
+                    }
+
+                    if let Some(content_type) = &part.content_type {
+                        part_builder = part_builder
+                            .mime_str(content_type)
+                            .map_err(|e| Error::Internal(format!("Invalid content type: {}", e)))?;
+                    }
+
+                    form = form.part(part.name.clone(), part_builder);
+                }
+                req_builder.multipart(form)
+            }
+            crate::body::Body::File { file, .. } => streamed(
+                req_builder,
+                file.len(),
+                progress_body(
+                    file.chunks(UPLOAD_CHUNK),
+                    file.len(),
+                    progress_callback.cloned(),
+                ),
+            ),
+            _ => {
+                let bytes = body_to_bytes(body)?;
+                match progress_callback {
+                    Some(callback) => {
+                        let total = bytes.len() as u64;
+                        streamed(
+                            req_builder,
+                            total,
+                            progress_body(
+                                bytes_chunks(bytes, UPLOAD_CHUNK),
+                                total,
+                                Some(callback.clone()),
+                            ),
+                        )
+                    }
+                    None => req_builder.body(bytes),
+                }
+            }
+        })
     }
 
     /// Get the underlying reqwest client
@@ -597,42 +766,78 @@ impl ReqwestBackend {
         &self.client
     }
 
-    /// Execute a background download
+    /// Download `url` to `file_path` with a transfer that can be resumed:
+    /// in a helper process that outlives this one if the host enabled it
+    /// (see [`enable_background_helper`](crate::enable_background_helper)),
+    /// and otherwise in the calling task.
+    ///
+    /// `session_identifier` means nothing to this backend. What a download
+    /// leaves on disk is named after its destination alone.
     pub async fn execute_background_download(
         &self,
         url: Url,
         file_path: std::path::PathBuf,
-        session_identifier: Option<String>,
-        headers: http::HeaderMap,
-        progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+        _session_identifier: Option<String>,
+        mut headers: http::HeaderMap,
+        progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
         error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
-        #[cfg(unix)]
-        {
-            background::execute_unix_background_download(
-                &self.client,
-                url,
-                file_path,
-                session_identifier,
-                headers,
-                progress_callback,
-                error_for_status,
-            )
-            .await
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error::InvalidUrl);
         }
 
-        #[cfg(not(unix))]
-        {
-            background::execute_resumable_background_download(
-                &self.client,
-                url,
-                file_path,
-                session_identifier,
-                headers,
-                progress_callback,
-            )
-            .await
+        // These change how the download is carried out, so one the client
+        // sends by default counts as the caller's own.
+        for name in [http::header::ACCEPT_ENCODING, http::header::RANGE] {
+            let defaults = self.default_headers.as_ref();
+            let default = defaults.and_then(|defaults| defaults.get(&name));
+            if let (Some(value), false) = (default, headers.contains_key(&name)) {
+                headers.insert(name, value.clone());
+            }
         }
+
+        let download = background::Download {
+            url,
+            headers,
+            destination: file_path,
+            error_for_status,
+            read_timeout: self.settings.read_timeout,
+        };
+        let progress = progress_callback.as_deref();
+
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos",
+                target_os = "visionos",
+                target_os = "android"
+            ))
+        ))]
+        {
+            // The helper has no access to the jar, so it is given the
+            // cookies for the URL it starts from. In this process the
+            // client takes them from the jar itself, hop by hop.
+            let mut job = download.clone();
+            if let Some(jar) = self.cookie_jar.as_ref().and_then(|jar| jar.cookie_store()) {
+                jar.add_cookie_header(&job.url, &mut job.headers);
+            }
+            let helped = helper::download(&self.settings, &job, progress).await;
+            if let Some(finished) = helped {
+                return Ok(finished?.into_response(download.destination));
+            }
+        }
+
+        let finished = background::run(&self.client, &download, |event| {
+            if let (background::Event::Progress { downloaded, total }, Some(progress)) =
+                (event, progress)
+            {
+                progress(downloaded, total);
+            }
+        })
+        .await?;
+        Ok(finished.into_response(download.destination))
     }
 
     /// Get the cookie jar if configured

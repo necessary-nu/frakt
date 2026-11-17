@@ -15,9 +15,10 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use objc2::rc::Retained;
 use objc2::{AllocAnyThread, ClassType, DefinedClass, define_class, msg_send};
 use objc2_foundation::{
-    NSData, NSError, NSHTTPURLResponse, NSObject, NSObjectProtocol, NSString,
-    NSURLAuthenticationChallenge, NSURLAuthenticationMethodServerTrust, NSURLCredential,
-    NSURLCredentialPersistence, NSURLResponse, NSURLSession, NSURLSessionAuthChallengeDisposition,
+    NSData, NSError, NSHTTPURLResponse, NSMutableCopying, NSMutableURLRequest, NSObject,
+    NSObjectProtocol, NSString, NSURL, NSURLAuthenticationChallenge,
+    NSURLAuthenticationMethodServerTrust, NSURLCredential, NSURLCredentialPersistence,
+    NSURLRequest, NSURLResponse, NSURLSession, NSURLSessionAuthChallengeDisposition,
     NSURLSessionDataDelegate, NSURLSessionDataTask, NSURLSessionDelegate,
     NSURLSessionResponseDisposition, NSURLSessionTask, NSURLSessionTaskDelegate,
     NSURLSessionTaskMetrics,
@@ -278,6 +279,23 @@ define_class!(
             }
         }
 
+        #[unsafe(method(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:))]
+        fn URLSession_task_willPerformHTTPRedirection_newRequest_completionHandler(
+            &self,
+            _session: &NSURLSession,
+            task: &NSURLSessionTask,
+            response: &NSHTTPURLResponse,
+            request: &NSURLRequest,
+            completion_handler: &DynBlock<dyn Fn(*mut NSURLRequest)>,
+        ) {
+            match redirected_request(task, response, request) {
+                Some(adjusted) => {
+                    completion_handler.call((Retained::as_ptr(&adjusted) as *mut NSURLRequest,))
+                }
+                None => completion_handler.call((request as *const NSURLRequest as *mut _,)),
+            }
+        }
+
         #[unsafe(method(URLSession:task:didSendBodyData:totalBytesSent:totalBytesExpectedToSend:))]
         fn URLSession_task_didSendBodyData_totalBytesSent_totalBytesExpectedToSend(
             &self,
@@ -400,6 +418,56 @@ impl DataTaskDelegate {
 
         None
     }
+}
+
+/// The request to send after a redirect when it should differ from the one
+/// CFNetwork proposes, so that credentials follow a redirect within the
+/// origin and no further, as on the other backends.
+///
+/// CFNetwork drops `Authorization` on every redirect, even one within the
+/// origin, and carries every other header the caller set to wherever the
+/// redirect points: a `Cookie`, an API key. Cookies from the session's
+/// storage are not in the request yet; CFNetwork adds the new URL's when it
+/// sends.
+fn redirected_request(
+    task: &NSURLSessionTask,
+    response: &NSHTTPURLResponse,
+    request: &NSURLRequest,
+) -> Option<Retained<NSMutableURLRequest>> {
+    let parse = |url: Option<Retained<NSURL>>| Url::parse(&url?.absoluteString()?.to_string()).ok();
+    // A URL that cannot be read is treated as another origin.
+    let same_origin = match (parse(response.URL()), parse(request.URL())) {
+        (Some(from), Some(to)) => crate::backend::redirect::same_origin(&from, &to),
+        _ => false,
+    };
+
+    if same_origin {
+        // From the request that was redirected, not the task's original
+        // one: after a detour through another origin the original's
+        // credentials must not come back.
+        let authorization = NSString::from_str("Authorization");
+        let sent = task
+            .currentRequest()?
+            .valueForHTTPHeaderField(&authorization)?;
+        if request.valueForHTTPHeaderField(&authorization).is_some() {
+            return None;
+        }
+        let restored = request.mutableCopy();
+        restored.setValue_forHTTPHeaderField(Some(&sent), &authorization);
+        return Some(restored);
+    }
+
+    let stripped = request.mutableCopy();
+    if let Some(fields) = request.allHTTPHeaderFields() {
+        let names = fields.allKeys();
+        for index in 0..names.count() {
+            let name = names.objectAtIndex(index);
+            if crate::redact::is_sensitive_header(&name.to_string().to_ascii_lowercase()) {
+                stripped.setValue_forHTTPHeaderField(None, &name);
+            }
+        }
+    }
+    Some(stripped)
 }
 
 fn response_head(response: &NSURLResponse) -> ResponseHead {

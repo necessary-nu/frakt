@@ -164,6 +164,20 @@ impl State {
             .or_default()
             .clone()
     }
+
+    /// How many requests whose query has `id=<id>` have arrived so far.
+    fn seen(&self, id: &str) -> usize {
+        let needle = format!("id={}", id);
+        let requests = self.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|r| {
+                r.target
+                    .split_once('?')
+                    .is_some_and(|(_, q)| q.split('&').any(|kv| kv == needle))
+            })
+            .count()
+    }
 }
 
 /// A running test server. Dropping it stops it.
@@ -380,9 +394,11 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Reques
         body: buf[head_end + 4..].to_vec(),
     };
 
+    // `/sink` reads its own body, so that it is never held in memory.
     let content_length: usize = request
         .header_str("content-length")
         .and_then(|v| v.parse().ok())
+        .filter(|_| request.path != "/sink")
         .unwrap_or(0);
     while request.body.len() < content_length {
         let mut chunk = vec![0u8; 64 * 1024];
@@ -510,6 +526,7 @@ async fn handle_one<S: AsyncRead + AsyncWrite + Unpin + Abort>(
             }
         }
         "/redirect" => {
+            // `cookie=` adds a Set-Cookie to the redirect itself.
             let status: u16 = request.q("status", 302);
             let to = request.q("to", String::from("/bytes"));
             let reason = match status {
@@ -519,13 +536,38 @@ async fn handle_one<S: AsyncRead + AsyncWrite + Unpin + Abort>(
                 308 => "Permanent Redirect",
                 _ => "Found",
             };
+            let mut headers = vec![("Location", to), ("Content-Length", "0".into())];
+            if let Some(cookie) = request.query.get("cookie") {
+                headers.push(("Set-Cookie", cookie.clone()));
+            }
+            write_head(&mut *stream, &format!("{} {}", status, reason), &headers).await?;
+        }
+        "/hops" => {
+            // `n` redirects in a row, the last of them to `/echo`.
+            let n: u32 = request.q("n", 1);
+            let to = if n > 1 {
+                format!("/hops?n={}", n - 1)
+            } else {
+                String::from("/echo")
+            };
             write_head(
                 &mut *stream,
-                &format!("{} {}", status, reason),
+                "302 Found",
                 &[("Location", to), ("Content-Length", "0".into())],
             )
             .await?;
         }
+        "/set-cookie" => {
+            let cookie = request.q("cookie", String::from("test=1"));
+            write_head(
+                &mut *stream,
+                "200 OK",
+                &[("Set-Cookie", cookie), ("Content-Length", "2".into())],
+            )
+            .await?;
+            stream.write_all(b"ok").await?;
+        }
+        "/sink" => serve_sink(&mut *stream, &request).await?,
         "/nonascii" => {
             // Raw bytes: UTF-8 in one header, a lone Latin-1 byte in another.
             let mut head =
@@ -588,9 +630,71 @@ async fn handle_one<S: AsyncRead + AsyncWrite + Unpin + Abort>(
     Ok(false)
 }
 
+/// `/sink`: read a request body of any size, hashing it as it arrives
+/// instead of keeping it, and answer with its length, BLAKE3 and framing
+/// headers as JSON.
+async fn serve_sink<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    request: &Request,
+) -> io::Result<()> {
+    let Some(length) = request
+        .header_str("content-length")
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return write_head(
+            stream,
+            "411 Length Required",
+            &[("Content-Length", "0".into())],
+        )
+        .await;
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&request.body);
+    let mut received = request.body.len() as u64;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while received < length {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        hasher.update(&chunk[..n]);
+        received += n as u64;
+    }
+
+    let reply = serde_json::json!({
+        "method": request.method,
+        "len": received,
+        "blake3": hasher.finalize().to_hex().to_string(),
+        "content_type": request.header_str("content-type"),
+        "transfer_encoding": request.header_str("transfer-encoding"),
+    })
+    .to_string();
+    write_head(
+        stream,
+        "200 OK",
+        &[
+            ("Content-Type", "application/json".into()),
+            ("Content-Length", reply.len().to_string()),
+        ],
+    )
+    .await?;
+    stream.write_all(reply.as_bytes()).await
+}
+
 /// `/bytes?len=&seed=&chunk=&track=&etag=&rate=`: a generated body with ETag,
 /// Last-Modified and byte-range support (`Range` with optional `If-Range`),
 /// sent at no more than `rate` bytes per second if given.
+///
+/// For the tests of resumed downloads it can also misbehave, or behave in
+/// ways a client must cope with: `norange=1` ignores `Range`, `noifrange=1`
+/// ignores `If-Range`, `noetag=1` sends no ETag, `skew=N` starts a 206 `N`
+/// bytes after the offset asked for, `maxrange=N` puts no more than `N`
+/// bytes in a 206, `total416=N` reports `N` as the length in a 416, `cond=1`
+/// answers `If-None-Match` and `If-Modified-Since` with a 304 when they
+/// match, and of the requests with the same `id` the first is answered with
+/// status `N` and no body for `failfirst=N`, or has its connection dropped
+/// after `N` body bytes for `cut=N`.
 async fn serve_bytes<S: AsyncWrite + Unpin>(
     stream: &mut S,
     request: &Request,
@@ -602,14 +706,29 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
     let etag = request.q("etag", etag(seed, len));
     let track = request.query.get("track").map(|id| state.track(id));
     let rate: Option<f64> = request.query.get("rate").and_then(|r| r.parse().ok());
+    let flag = |name: &str| request.q(name, 0u8) == 1;
+    let skew: u64 = request.q("skew", 0);
+    let first = request
+        .query
+        .get("id")
+        .is_some_and(|id| state.seen(id) == 1);
+    let cut: Option<u64> = request
+        .query
+        .get("cut")
+        .and_then(|v| v.parse().ok())
+        .filter(|_| first);
+    if let (true, Some(code)) = (first, request.query.get("failfirst")) {
+        let status = format!("{} Status", code);
+        return write_head(stream, &status, &[("Content-Length", "0".into())]).await;
+    }
 
     let validator_matches = match request.header_str("if-range") {
         None => true,
-        Some(v) => v == etag || v == LAST_MODIFIED,
+        Some(v) => flag("noifrange") || v == etag || v == LAST_MODIFIED,
     };
     let range = request
         .header_str("range")
-        .filter(|_| validator_matches)
+        .filter(|_| validator_matches && !flag("norange"))
         .and_then(|r| {
             let spec = r.strip_prefix("bytes=")?;
             let (start, end) = spec.split_once('-')?;
@@ -628,17 +747,35 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
         ("Accept-Ranges", "bytes".to_string()),
         ("Content-Type", "application/octet-stream".to_string()),
     ];
+    let common: Vec<(&str, String)> = common
+        .into_iter()
+        .filter(|(name, _)| !(flag("noetag") && *name == "ETag"))
+        .collect();
+
+    if flag("cond") {
+        let unchanged = match request.header_str("if-none-match") {
+            Some(v) => v == etag,
+            None => request.header_str("if-modified-since").as_deref() == Some(LAST_MODIFIED),
+        };
+        if unchanged {
+            write_head(stream, "304 Not Modified", &common).await?;
+            return Ok(());
+        }
+    }
 
     let (start, end) = match range {
         Some((start, _)) if start >= len => {
             let mut headers = common.to_vec();
-            headers.push(("Content-Range", format!("bytes */{}", len)));
+            let total = request.q("total416", len);
+            headers.push(("Content-Range", format!("bytes */{}", total)));
             headers.push(("Content-Length", "0".into()));
             write_head(stream, "416 Range Not Satisfiable", &headers).await?;
             return Ok(());
         }
         Some((start, end)) => {
             let end = end.map(|e| (e + 1).min(len)).unwrap_or(len);
+            let start = start + skew;
+            let end = end.min(start.saturating_add(request.q("maxrange", u64::MAX)));
             let mut headers = common.to_vec();
             headers.push((
                 "Content-Range",
@@ -660,6 +797,8 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
         return Ok(());
     }
 
+    let promised = end;
+    let end = cut.map_or(end, |cut| end.min(start + cut));
     let mut buf = vec![0u8; chunk];
     let mut pos = start;
     let started = tokio::time::Instant::now();
@@ -680,6 +819,11 @@ async fn serve_bytes<S: AsyncWrite + Unpin>(
         if let Some(track) = &track {
             track.written.fetch_add(n as u64, Ordering::SeqCst);
         }
+    }
+    if end < promised {
+        // An error ends the connection without the rest of the body.
+        stream.flush().await?;
+        return Err(io::ErrorKind::ConnectionAborted.into());
     }
     if let Some(track) = &track {
         track.finish(false);

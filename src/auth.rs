@@ -19,27 +19,27 @@ use std::fmt;
 /// // Basic authentication
 /// let response = client
 ///     .get("https://httpbin.org/basic-auth/user/pass")?
-///     .auth(Auth::basic("user", "pass"))
+///     .auth(Auth::basic("user", "pass"))?
 ///     .send()
 ///     .await?;
 ///
 /// // Bearer token
 /// let response = client
 ///     .get("https://api.example.com/protected")?
-///     .auth(Auth::bearer("your-jwt-token"))
+///     .auth(Auth::bearer("your-jwt-token"))?
 ///     .send()
 ///     .await?;
 ///
 /// // Custom authentication
 /// let response = client
 ///     .get("https://api.example.com/data")?
-///     .auth(Auth::custom("ApiKey", "your-api-key"))
+///     .auth(Auth::custom("ApiKey", "your-api-key"))?
 ///     .send()
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Auth {
     /// HTTP Basic authentication with username and password.
     ///
@@ -68,7 +68,44 @@ pub enum Auth {
     },
 }
 
+/// Passwords, tokens and credentials are not shown.
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::redact::Redacted;
+        match self {
+            Auth::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &Redacted)
+                .finish(),
+            Auth::Bearer { .. } => f.debug_struct("Bearer").field("token", &Redacted).finish(),
+            Auth::Custom { scheme, .. } => f
+                .debug_struct("Custom")
+                .field("scheme", scheme)
+                .field("credentials", &Redacted)
+                .finish(),
+        }
+    }
+}
+
 impl Auth {
+    /// The `Authorization` header value, or [`Error::InvalidHeader`](crate::Error::InvalidHeader)
+    /// if it would not be a valid one: a custom scheme that is not an HTTP
+    /// token, or a token or credentials containing a line break or other
+    /// control character.
+    pub(crate) fn header_value(&self) -> crate::Result<http::HeaderValue> {
+        if let Auth::Custom { scheme, .. } = self {
+            let token_char = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+            if scheme.is_empty() || !scheme.chars().all(token_char) {
+                return Err(crate::Error::InvalidHeader);
+            }
+        }
+        let mut value = http::HeaderValue::from_str(&self.to_header_value())
+            .map_err(|_| crate::Error::InvalidHeader)?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
     /// Create HTTP Basic authentication.
     ///
     /// This method creates Basic authentication using the provided username and password.
@@ -215,5 +252,45 @@ mod tests {
     fn test_custom_auth() {
         let auth = Auth::custom("ApiKey", "secret123");
         assert_eq!(auth.to_header_value(), "ApiKey secret123");
+    }
+
+    #[test]
+    fn invalid_credentials_are_errors_not_panics() {
+        for auth in [
+            Auth::custom("x", "a\r\nb"),
+            Auth::bearer("token\nInjected: 1"),
+            Auth::custom("two words", "ok"),
+            Auth::custom("", "ok"),
+            Auth::custom("x\r\n", "ok"),
+        ] {
+            assert!(
+                matches!(auth.header_value(), Err(crate::Error::InvalidHeader)),
+                "{}",
+                auth
+            );
+        }
+        assert_eq!(
+            Auth::basic("user", "pa\nss").header_value().unwrap(),
+            "Basic dXNlcjpwYQpzcw=="
+        );
+        assert!(
+            Auth::bearer("token123")
+                .header_value()
+                .unwrap()
+                .is_sensitive()
+        );
+    }
+
+    #[test]
+    fn debug_does_not_show_secrets() {
+        for auth in [
+            Auth::basic("alice", "hunter2"),
+            Auth::bearer("hunter2"),
+            Auth::custom("ApiKey", "hunter2"),
+        ] {
+            let debug = format!("{:?}", auth);
+            assert!(!debug.contains("hunter2"), "{}", debug);
+        }
+        assert!(format!("{:?}", Auth::basic("alice", "hunter2")).contains("alice"));
     }
 }

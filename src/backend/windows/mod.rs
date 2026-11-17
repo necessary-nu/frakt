@@ -20,10 +20,9 @@ use url::Url;
 pub struct WindowsBackend {
     /// The WinHTTP session every request of this backend uses
     session: Arc<http_client::Session>,
-    /// Optional cookie jar for this backend
+    /// The jar requests send cookies from and store them into, which is the
+    /// one `cookie_jar` hands out; `None` when cookies are off
     cookie_jar: Option<crate::CookieJar>,
-    /// Cookie storage using cookie_store
-    cookie_storage: Option<Arc<crate::backend::CookieJar>>,
     /// Default headers to add to all requests
     default_headers: Option<http::HeaderMap>,
     connect_timeout: Option<Duration>,
@@ -40,6 +39,7 @@ impl WindowsBackend {
 
     /// Create a new Windows backend with configuration
     pub fn with_config(config: crate::backend::BackendConfig) -> Result<Self> {
+        let cookie_jar = config.cookie_store_jar()?;
         let user_agent = config.user_agent.as_deref().unwrap_or("frakt/1.0");
         let proxy = [("http", &config.http_proxy), ("https", &config.https_proxy)]
             .into_iter()
@@ -53,17 +53,9 @@ impl WindowsBackend {
         let session =
             http_client::Session::open(user_agent, (!proxy.is_empty()).then_some(proxy.as_str()))?;
 
-        // Create cookie storage if cookies are enabled
-        let cookie_storage = if config.use_cookies.unwrap_or(false) {
-            Some(Arc::new(crate::backend::CookieJar::new()))
-        } else {
-            None
-        };
-
         Ok(Self {
             session: Arc::new(session),
-            cookie_jar: config.cookie_jar,
-            cookie_storage,
+            cookie_jar,
             default_headers: config.default_headers,
             connect_timeout: config.connect_timeout,
             read_timeout: config.read_timeout,
@@ -78,7 +70,7 @@ impl WindowsBackend {
             http_client::RequestConfig {
                 session: &self.session,
                 default_headers: self.default_headers.as_ref(),
-                cookie_storage: self.cookie_storage.as_ref(),
+                cookie_jar: self.cookie_jar.as_ref().and_then(|jar| jar.cookie_store()),
                 connect_timeout: self.connect_timeout,
                 read_timeout: self.read_timeout,
                 ignore_certificate_errors: self.ignore_certificate_errors,
@@ -88,72 +80,78 @@ impl WindowsBackend {
         .await
     }
 
-    /// Execute a background download
+    /// Download `url` to `file_path`, through BITS when it can do the job
+    /// and through WinHTTP otherwise.
     pub async fn execute_background_download(
         &self,
         url: Url,
         file_path: std::path::PathBuf,
         session_identifier: Option<String>,
         headers: http::HeaderMap,
-        progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
-        _error_for_status: bool,
+        progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
+        error_for_status: bool,
     ) -> Result<crate::client::download::DownloadResponse> {
-        // Try BITS first if available, fall back to regular download.
         // The BITS manager is created here rather than kept in the backend:
-        // its COM interface is neither Send nor Sync, which made every
-        // client and request future !Send, and creating it initialises COM
-        // on the calling thread.
-        if let Ok(bits_manager) = BitsDownloadManager::new() {
-            // For now, disable progress callbacks with BITS to avoid lifetime issues
-            // TODO: Fix progress callback lifetime management
-            // TODO: Pass headers to BITS manager when it supports them
+        // it is a worker thread holding the BITS COM interfaces, which a
+        // backend that never downloads in the background should not start,
+        // and BITS being unavailable for one download says nothing about
+        // the next.
+        let bits_manager = BitsDownloadManager::new()
+            .await
+            .inspect_err(|error| tracing::debug!("Not using BITS: {}", error));
+        if let Ok(bits_manager) = bits_manager {
+            // BITS sends only what it is given, so it is given what a WinHTTP
+            // request would carry: the default headers, the request's own in
+            // place of them, and the jar's cookies. It reports no response
+            // headers, so cookies the server sets are not stored.
+            let mut bits_headers = self.default_headers.clone().unwrap_or_default();
+            for name in headers.keys() {
+                bits_headers.remove(name);
+            }
+            for (name, value) in &headers {
+                bits_headers.append(name, value.clone());
+            }
+            if let Some(jar) = self.cookie_jar.as_ref().and_then(|jar| jar.cookie_store()) {
+                jar.add_cookie_header(&url, &mut bits_headers);
+            }
+
             match bits_manager
-                .start_background_download(url.clone(), file_path.clone(), session_identifier, None)
+                .start_background_download(
+                    url.clone(),
+                    file_path.clone(),
+                    session_identifier,
+                    &bits_headers,
+                    progress_callback.as_deref(),
+                    error_for_status,
+                )
                 .await
             {
                 Ok(response) => return Ok(response),
+                // The server's answer, which WinHTTP would only be given
+                // again.
+                Err(error @ Error::HttpStatus(_)) => return Err(error),
                 Err(e) => {
                     tracing::warn!("BITS download failed, falling back to WinHTTP: {}", e);
                 }
             }
         }
-        let request = BackendRequest {
-            method: http::Method::GET,
+
+        // An ordinary download: the destination is replaced only once the
+        // whole body is on disk.
+        crate::client::DownloadBuilder::new(
+            crate::backend::Backend::Windows(self.clone()),
             url,
-            headers, // Use the provided headers
-            body: None,
-            progress_callback: progress_callback
-                .map(|cb| Arc::new(cb) as Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>),
-            read_timeout: None,
-        };
-
-        let response = self.execute(request).await?;
-
-        let status = response.status;
-        let headers = response.headers;
-
-        // Stream response to file
-        let mut file = tokio::fs::File::create(&file_path)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create file: {}", e)))?;
-
-        let mut body = response.body;
-        let mut bytes_downloaded = 0u64;
-
-        while let Some(chunk_result) = futures_util::StreamExt::next(&mut body).await {
-            let chunk = chunk_result?;
-            bytes_downloaded += chunk.len() as u64;
-
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-                .await
-                .map_err(|e| Error::Internal(format!("Failed to write to file: {}", e)))?;
-        }
-
-        Ok(crate::client::download::DownloadResponse {
             file_path,
-            bytes_downloaded,
-            status,
-            headers,
+        )
+        .headers(headers)
+        .progress_callback(progress_callback)
+        .error_for_status(error_for_status)
+        .send()
+        .await
+        .map_err(|error| match error {
+            // A background download has no response to hand over.
+            Error::HttpError(response) => Error::HttpStatus(response.status()),
+            error => error,
         })
     }
 

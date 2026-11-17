@@ -59,7 +59,7 @@ pub struct UploadBuilder {
     file_path: Option<(std::path::PathBuf, String)>, // (path, content_type)
     data: Option<Vec<u8>>,
     headers: HeaderMap,
-    progress_callback: Option<Box<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>>,
+    progress_callback: Option<crate::backend::types::BoxedProgressCallback>,
     error_for_status: bool,
 }
 
@@ -79,9 +79,12 @@ impl UploadBuilder {
 
     /// Upload a file from the local filesystem.
     ///
-    /// The file will be read asynchronously when the upload is sent. The content type
-    /// will be automatically detected based on the file extension, or defaults to
-    /// `application/octet-stream` if the extension is not recognized.
+    /// The file is opened when the upload is sent and read from disk as it
+    /// goes out, so memory use does not grow with its size; see
+    /// [`FileBody`](crate::FileBody) for what happens if it changes
+    /// meanwhile. The content type is guessed from the file extension, or
+    /// defaults to `application/octet-stream` if the extension is not
+    /// recognized.
     ///
     /// # Arguments
     ///
@@ -285,9 +288,8 @@ impl UploadBuilder {
     /// # }
     /// ```
     pub fn auth(mut self, auth: crate::Auth) -> crate::Result<Self> {
-        let header_value = HeaderValue::from_str(&auth.to_header_value())
-            .map_err(|_| crate::Error::InvalidHeader)?;
-        self.headers.insert("authorization", header_value);
+        self.headers
+            .insert(http::header::AUTHORIZATION, auth.header_value()?);
         Ok(self)
     }
 
@@ -355,7 +357,8 @@ impl UploadBuilder {
     /// Execute the upload and return the response.
     ///
     /// This method performs the actual upload using the configured data or file.
-    /// The upload is performed asynchronously and will stream the data to the server.
+    /// A file is streamed from disk; data given with `from_data` is sent
+    /// from memory.
     ///
     /// # Returns
     ///
@@ -409,15 +412,10 @@ impl UploadBuilder {
             ));
         };
 
-        // Create request
         let mut request_builder =
             crate::RequestBuilder::new(http::Method::POST, self.url, self.backend)
-                .error_for_status(self.error_for_status);
-
-        // Add headers
-        for (name, value) in &self.headers {
-            request_builder = request_builder.header(name.as_str(), value.to_str().unwrap())?;
-        }
+                .error_for_status(self.error_for_status)
+                .headers(self.headers);
 
         // Add progress callback if set
         if let Some(callback) = self.progress_callback {

@@ -1,12 +1,25 @@
-//! Running a request on Cronet and streaming its body.
+//! Running a request on Cronet, following its redirects, and streaming its
+//! body.
+//!
+//! Redirects are followed here, one `UrlRequest` per hop, and never by
+//! Cronet: `followRedirect()` would send the headers the request was built
+//! with, the jar's cookies for the first URL among them, to wherever the
+//! redirect leads. Doing it here also puts each redirect's `Set-Cookie` in
+//! the jar before the next hop's cookies are taken from it.
 
-use super::callback::{self, MAX_QUEUED_CHUNKS, READ_BUFFER_SIZE, RequestShared, java_error};
+use super::callback::{
+    self, MAX_QUEUED_CHUNKS, RequestShared, ResponseHead, UploadSource, java_error,
+};
 use super::jni_bindings::UrlRequestBuilder;
-use crate::backend::types::{BackendRequest, BackendResponse, BodyAccounting};
+use crate::backend::redirect;
+use crate::backend::types::{
+    BackendRequest, BackendResponse, BodyAccounting, BodyIntegrity, ProgressCallback,
+};
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::Stream;
-use jni::objects::{Global, JObject, JValue};
+use http::{HeaderMap, Method};
+use jni::objects::{Global, JObject};
 use jni::sys::jlong;
 use jni::{Env, JavaVM, jni_sig, jni_str};
 use std::future::Future;
@@ -15,6 +28,27 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Sleep;
+use url::Url;
+
+/// The Cronet engine, borrowed from the backend.
+///
+/// The futures here must be `Send`, and one that keeps a bare
+/// `&Global<JObject<'static>>` across an await is not: the compiler forgets
+/// the `'static` of a type it finds held in a future, and jni makes only
+/// `JObject<'static>` `Send`. Inside a named type the lifetime is kept.
+#[derive(Clone, Copy)]
+pub struct Engine<'a>(pub &'a Global<JObject<'static>>);
+
+/// Fails to compile if the request future is not `Send`. Callers spawn
+/// requests onto multi-threaded runtimes, and nothing else in a build of the
+/// library for Android asks for it.
+#[allow(dead_code)]
+const _: () = {
+    fn assert_send<T: Send>(_: T) {}
+    fn request_is_send(jvm: &'static JavaVM, engine: Engine<'static>, request: BackendRequest) {
+        assert_send(execute_request(jvm, engine, request, None, None));
+    }
+};
 
 /// A started Cronet request. Dropping it forgets the request's callbacks and
 /// cancels the request unless Cronet has already finished it.
@@ -43,26 +77,199 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         callback::unregister(self.id);
-        let finished = self.shared.inner.lock().unwrap().finished.is_some();
-        if !finished {
+        let terminated = self.shared.inner.lock().unwrap().terminated;
+        if !terminated {
             self.cancel();
         }
     }
 }
 
-/// Run `request` and return once the response has started.
+/// A request body in the form Cronet is given it, once per hop that sends
+/// it.
+struct Upload {
+    source: UploadSource,
+    length: jlong,
+    /// Sent as Content-Type unless the caller set one. Never empty: Cronet
+    /// refuses to start an upload without a Content-Type.
+    content_type: String,
+}
+
+impl Upload {
+    fn new(body: crate::body::Body) -> Result<Option<Self>> {
+        use crate::body::Body;
+        let (source, content_type) = match body {
+            Body::Empty => return Ok(None),
+            Body::Bytes {
+                content,
+                content_type,
+            } => (UploadSource::Bytes(content), content_type),
+            Body::Form { fields } => {
+                let encoded = fields
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                (
+                    UploadSource::Bytes(encoded.into()),
+                    "application/x-www-form-urlencoded".to_string(),
+                )
+            }
+            Body::Json { value } => (
+                UploadSource::Bytes(
+                    serde_json::to_vec(&value)
+                        .map_err(|e| Error::Json(e.to_string()))?
+                        .into(),
+                ),
+                "application/json".to_string(),
+            ),
+            Body::File { file, content_type } => (UploadSource::File(file), content_type),
+            Body::Multipart { .. } => {
+                return Err(Error::Internal(
+                    "Multipart bodies are not supported by the Android backend".to_string(),
+                ));
+            }
+        };
+        let length = jlong::try_from(source.len())
+            .map_err(|_| Error::Internal("The request body is too large for Cronet".to_string()))?;
+        let content_type = if content_type.is_empty() {
+            "application/octet-stream".to_string()
+        } else {
+            content_type
+        };
+        Ok(Some(Self {
+            source,
+            length,
+            content_type,
+        }))
+    }
+}
+
+/// One request of a redirect chain.
+struct Outgoing<'a> {
+    method: &'a Method,
+    url: &'a Url,
+    /// Everything to send, the jar's cookies included.
+    headers: &'a HeaderMap,
+    upload: Option<&'a Upload>,
+    progress: Option<&'a ProgressCallback>,
+}
+
+/// How far Cronet took one request.
+enum Outcome {
+    /// The response has started and its body can be read.
+    Response(ResponseHead, Arc<BodyAccounting>),
+    /// Cronet stopped at a redirect response and waits to be told to follow
+    /// it. It never reads that response's body.
+    Redirect(ResponseHead),
+}
+
+/// Run `request`, following redirects, and return once the final response
+/// has started.
 ///
-/// `read_timeout` bounds the wait for the response to start, restarting
-/// whenever there is progress (an upload chunk or a redirect), and then each
-/// wait for the next body chunk.
+/// `request.headers` are what the caller asked to send, client defaults
+/// included; cookies from `cookies` are added for each hop's URL, and each
+/// response's cookies stored for the URL that sent them.
+///
+/// `read_timeout` bounds the wait for each hop's response to start,
+/// restarting whenever there is progress (an upload chunk or a redirect),
+/// and then each wait for the next body chunk.
 pub async fn execute_request(
     jvm: &'static JavaVM,
-    cronet_engine: &Global<JObject<'static>>,
+    engine: Engine<'_>,
     request: BackendRequest,
+    cookies: Option<&crate::backend::CookieJar>,
     read_timeout: Option<Duration>,
 ) -> Result<BackendResponse> {
-    let original_url = request.url.clone();
-    let shared = Arc::new(RequestShared::new(request.progress_callback.clone()));
+    let main_document = request.url.clone();
+    let progress = request.progress_callback;
+    let mut upload = match request.body {
+        Some(body) => Upload::new(body)?,
+        None => None,
+    };
+    let (mut method, mut url, mut headers) = (request.method, request.url, request.headers);
+    let mut redirects = 0;
+
+    loop {
+        let mut sent = headers.clone();
+        if let Some(jar) = cookies {
+            jar.add_cookie_header(&url, &mut sent);
+        }
+        let outgoing = Outgoing {
+            method: &method,
+            url: &url,
+            headers: &sent,
+            upload: upload.as_ref(),
+            progress: progress.as_ref(),
+        };
+        let (guard, outcome) = send(jvm, engine, &outgoing, read_timeout).await?;
+
+        let redirect = match outcome {
+            Outcome::Response(head, accounting) => {
+                let url = head.url.unwrap_or(url);
+                if let Some(jar) = cookies {
+                    jar.store_response_cookies(&main_document, &url, &head.headers);
+                }
+                return Ok(BackendResponse {
+                    status: head.status,
+                    accounting,
+                    headers: head.headers,
+                    url,
+                    body: Box::pin(CronetBody {
+                        guard,
+                        idle: IdleTimer::new(read_timeout),
+                        done: false,
+                    }),
+                });
+            }
+            Outcome::Redirect(head) => head,
+        };
+        // Whatever comes next, this request has nothing more to give.
+        drop(guard);
+
+        let from = redirect.url.unwrap_or(url);
+        if let Some(jar) = cookies {
+            jar.store_response_cookies(&main_document, &from, &redirect.headers);
+        }
+        let Some(hop) =
+            redirect::next_hop(&method, &from, &headers, redirect.status, &redirect.headers)
+        else {
+            // Not a redirect to follow, so it is the response; but Cronet
+            // only offers a redirect's head, so the body is empty whatever
+            // the server sent, and no length is promised for it.
+            let accounting = BodyAccounting::new(false, None);
+            accounting.set_integrity(BodyIntegrity::Unverifiable);
+            return Ok(BackendResponse {
+                status: redirect.status,
+                accounting,
+                headers: redirect.headers,
+                url: from,
+                body: Box::pin(futures_util::stream::empty()),
+            });
+        };
+
+        redirects += 1;
+        if redirects > redirect::MAX_REDIRECTS {
+            return Err(redirect::too_many_redirects());
+        }
+        if !hop.keep_body {
+            upload = None;
+        }
+        (method, url, headers) = (hop.method, hop.url, hop.headers);
+    }
+}
+
+/// Start one Cronet request and wait until its response starts or it stops
+/// at a redirect.
+async fn send(
+    jvm: &'static JavaVM,
+    engine: Engine<'_>,
+    outgoing: &Outgoing<'_>,
+    read_timeout: Option<Duration>,
+) -> Result<(RequestGuard, Outcome)> {
+    let shared = Arc::new(RequestShared::new(
+        outgoing.upload.map(|upload| upload.source.clone()),
+        outgoing.progress.cloned(),
+    ));
     let id = callback::register(shared.clone());
     let guard = RequestGuard {
         jvm,
@@ -71,20 +278,22 @@ pub async fn execute_request(
     };
 
     super::attached(jvm, 32, |env| {
-        start_request(env, cronet_engine, request, id, &shared)
+        start_request(env, engine.0, outgoing, id, &shared)
     })?;
 
     let mut idle = IdleTimer::new(read_timeout);
-    let (head, redirect_headers, accounting) = std::future::poll_fn(|cx| {
+    let outcome = std::future::poll_fn(|cx| {
         let activity = {
             let mut inner = shared.inner.lock().unwrap();
+            if let Some(head) = inner.redirect.take() {
+                return Poll::Ready(Ok(Outcome::Redirect(head)));
+            }
             if let Some(head) = inner.head.take() {
-                let redirects = std::mem::take(&mut inner.redirect_headers);
                 let accounting = inner
                     .accounting
                     .clone()
                     .unwrap_or_else(|| BodyAccounting::undecoded(&head.headers));
-                return Poll::Ready(Ok((head, redirects, accounting)));
+                return Poll::Ready(Ok(Outcome::Response(head, accounting)));
             }
             if let Some(result) = inner.finished.as_mut() {
                 let error = match std::mem::replace(result, Ok(())) {
@@ -103,18 +312,7 @@ pub async fn execute_request(
     })
     .await?;
 
-    Ok(BackendResponse {
-        status: head.status,
-        accounting,
-        headers: head.headers,
-        url: head.url.unwrap_or(original_url),
-        body: Box::pin(CronetBody {
-            guard,
-            idle: IdleTimer::new(read_timeout),
-            done: false,
-        }),
-        redirect_headers,
-    })
+    Ok((guard, outcome))
 }
 
 /// A read timeout that only runs while someone waits and restarts whenever
@@ -234,65 +432,29 @@ fn header_value_string(value: &http::HeaderValue) -> String {
     }
 }
 
-fn body_bytes(body: crate::body::Body) -> Result<Option<(Vec<u8>, Option<String>)>> {
-    use crate::body::Body;
-    Ok(match body {
-        Body::Empty => None,
-        Body::Bytes {
-            content,
-            content_type,
-        } => Some((content.to_vec(), Some(content_type))),
-        Body::Form { fields } => {
-            let encoded = fields
-                .iter()
-                .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
-                .collect::<Vec<_>>()
-                .join("&");
-            Some((
-                encoded.into_bytes(),
-                Some("application/x-www-form-urlencoded".to_string()),
-            ))
-        }
-        Body::Json { value } => Some((
-            serde_json::to_vec(&value).map_err(|e| Error::Json(e.to_string()))?,
-            Some("application/json".to_string()),
-        )),
-        Body::Multipart { .. } => {
-            return Err(Error::Internal(
-                "Multipart bodies are not supported by the Android backend".to_string(),
-            ));
-        }
-    })
-}
-
-/// Build the `UrlRequest`, hand its read buffer and handle to `shared`, and
-/// start it.
+/// Build the `UrlRequest`, hand its handle to `shared`, and start it.
 fn start_request(
     env: &mut Env,
     cronet_engine: &Global<JObject<'static>>,
-    request: BackendRequest,
+    outgoing: &Outgoing<'_>,
     id: jlong,
     shared: &RequestShared,
 ) -> Result<()> {
     let callback = callback::create_callback_instance(env, id)?;
     let executor = super::callback_executor(env)?;
-    let body = match request.body {
-        Some(body) => body_bytes(body)?,
-        None => None,
-    };
 
     let mut builder = UrlRequestBuilder::new(
         env,
         cronet_engine.as_obj(),
-        request.url.as_str(),
+        outgoing.url.as_str(),
         &callback,
         executor.as_obj(),
     )
     .map_err(|e| Error::Internal(format!("UrlRequest.Builder: {}", e)))?;
     builder
-        .set_http_method(request.method.as_str())
+        .set_http_method(outgoing.method.as_str())
         .map_err(|e| Error::Internal(format!("setHttpMethod: {}", e)))?;
-    for (name, value) in &request.headers {
+    for (name, value) in outgoing.headers {
         let value = header_value_string(value);
         if name == http::header::ACCEPT_ENCODING {
             let forced = builder
@@ -308,26 +470,14 @@ fn start_request(
             .map_err(|e| Error::Internal(format!("addHeader({}): {}", name, e)))?;
     }
 
-    if let Some((bytes, content_type)) = body {
-        if let Some(content_type) = content_type {
-            if !request.headers.contains_key(http::header::CONTENT_TYPE) {
-                builder
-                    .add_header("Content-Type", &content_type)
-                    .map_err(|e| Error::Internal(format!("addHeader(Content-Type): {}", e)))?;
-            }
+    if let Some(upload) = outgoing.upload {
+        if !outgoing.headers.contains_key(http::header::CONTENT_TYPE) {
+            builder
+                .add_header("Content-Type", &upload.content_type)
+                .map_err(|e| Error::Internal(format!("addHeader(Content-Type): {}", e)))?;
         }
-        let provider = builder.with_env(|env| {
-            let data = env
-                .byte_array_from_slice(&bytes)
-                .map_err(|e| java_error(env, "NewByteArray", e))?;
-            let class = callback::upload_provider_class(env)?;
-            env.new_object(
-                class,
-                jni_sig!("([BJ)V"),
-                &[JValue::Object(&data), JValue::Long(id)],
-            )
-            .map_err(|e| java_error(env, "ProgressTrackingUploadDataProvider", e))
-        })?;
+        let provider =
+            builder.with_env(|env| callback::create_upload_provider(env, id, upload.length))?;
         builder
             .set_upload_data_provider(&provider, executor.as_obj())
             .map_err(|e| Error::Internal(format!("setUploadDataProvider: {}", e)))?;
@@ -336,20 +486,6 @@ fn start_request(
     let url_request = builder
         .build()
         .map_err(|e| Error::Internal(format!("UrlRequest.Builder.build: {}", e)))?;
-
-    let buffer = env
-        .call_static_method(
-            jni_str!("java/nio/ByteBuffer"),
-            jni_str!("allocateDirect"),
-            jni_sig!("(I)Ljava/nio/ByteBuffer;"),
-            &[JValue::Int(READ_BUFFER_SIZE)],
-        )
-        .and_then(|v| v.l())
-        .map_err(|e| java_error(env, "ByteBuffer.allocateDirect", e))?;
-    let buffer = env
-        .new_global_ref(buffer)
-        .map_err(|e| java_error(env, "NewGlobalRef", e))?;
-    let _ = shared.read_buffer.set(buffer);
     let global_request = env
         .new_global_ref(&url_request)
         .map_err(|e| java_error(env, "NewGlobalRef", e))?;

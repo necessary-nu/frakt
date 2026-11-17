@@ -17,6 +17,13 @@ fn main() {
     // Find javac
     let javac = find_javac().expect("javac not found. Please install JDK and set JAVA_HOME");
 
+    // OUT_DIR outlives a build, and every class found goes into the DEX, so
+    // the classes get a directory that starts empty: one whose source was
+    // renamed or deleted must not be packaged again.
+    let class_dir = out_dir.join("classes");
+    let _ = std::fs::remove_dir_all(&class_dir);
+    std::fs::create_dir_all(&class_dir).expect("Failed to create the class output directory");
+
     // Compile Java sources
     let sources = vec![
         // Cronet stubs
@@ -30,13 +37,13 @@ fn main() {
         java_dir.join("stubs/java/nio/ByteBuffer.java"),
         // Our callback implementation
         java_dir.join("se/brendan/frakt/RustUrlRequestCallback.java"),
-        // Upload progress tracking
-        java_dir.join("se/brendan/frakt/ProgressTrackingUploadDataProvider.java"),
+        // Request bodies, read from Rust
+        java_dir.join("se/brendan/frakt/RustUploadDataProvider.java"),
     ];
 
     let status = Command::new(&javac)
         .arg("-d")
-        .arg(&out_dir)
+        .arg(&class_dir)
         .arg("-source")
         .arg("8")
         .arg("-target")
@@ -55,20 +62,20 @@ fn main() {
 
     println!(
         "cargo:warning=Compiled Java callback class to {}",
-        out_dir.display()
+        class_dir.display()
     );
 
     // Convert .class files to .dex format for Android
-    convert_to_dex(&out_dir);
+    convert_to_dex(&class_dir, &out_dir);
 }
 
-fn convert_to_dex(class_dir: &Path) {
+fn convert_to_dex(class_dir: &Path, dex_dir: &Path) {
     // Find d8 tool from Android SDK
     let d8 = find_d8().expect(
         "d8 not found. Please install Android SDK and set ANDROID_HOME or ANDROID_SDK_ROOT",
     );
 
-    let dex_output = class_dir.join("classes.dex");
+    let dex_output = dex_dir.join("classes.dex");
 
     // Collect all .class files recursively
     let mut class_files = Vec::new();
@@ -84,13 +91,13 @@ fn convert_to_dex(class_dir: &Path) {
             }
         }
     }
-    collect_class_files(&class_dir, &mut class_files);
+    collect_class_files(class_dir, &mut class_files);
 
     // Run d8 to convert all class files to DEX
     let mut d8_command = Command::new(&d8);
     d8_command
         .arg("--output")
-        .arg(class_dir)
+        .arg(dex_dir)
         .arg("--min-api")
         .arg("21"); // Minimum API level
 
@@ -107,51 +114,23 @@ fn convert_to_dex(class_dir: &Path) {
     println!("cargo:warning=Converted to DEX: {}", dex_output.display());
 }
 
+/// d8 from the newest build-tools of the SDK that `ANDROID_HOME` or, failing
+/// that, `ANDROID_SDK_ROOT` names.
 fn find_d8() -> Option<PathBuf> {
-    // Try ANDROID_HOME first
-    if let Ok(android_home) = env::var("ANDROID_HOME") {
-        let d8 = PathBuf::from(android_home).join("build-tools");
-        if d8.exists() {
-            // Find the latest build-tools version
-            if let Ok(entries) = std::fs::read_dir(&d8) {
-                let mut versions: Vec<_> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .collect();
-                versions.sort_by(|a, b| b.path().cmp(&a.path()));
-
-                if let Some(latest) = versions.first() {
-                    let d8_path = latest.path().join("d8");
-                    if d8_path.exists() {
-                        return Some(d8_path);
-                    }
-                }
-            }
-        }
-    }
-
-    // Try ANDROID_SDK_ROOT
-    if let Ok(sdk_root) = env::var("ANDROID_SDK_ROOT") {
-        let d8 = PathBuf::from(sdk_root).join("build-tools");
-        if d8.exists() {
-            if let Ok(entries) = std::fs::read_dir(&d8) {
-                let mut versions: Vec<_> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .collect();
-                versions.sort_by(|a, b| b.path().cmp(&a.path()));
-
-                if let Some(latest) = versions.first() {
-                    let d8_path = latest.path().join("d8");
-                    if d8_path.exists() {
-                        return Some(d8_path);
-                    }
-                }
-            }
-        }
-    }
-
-    None
+    ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
+        .into_iter()
+        .filter_map(|variable| env::var(variable).ok())
+        .find_map(|sdk| {
+            let mut versions: Vec<_> = std::fs::read_dir(PathBuf::from(sdk).join("build-tools"))
+                .ok()?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            versions.sort();
+            let d8 = versions.last()?.join("d8");
+            d8.exists().then_some(d8)
+        })
 }
 
 fn find_javac() -> Option<PathBuf> {
@@ -164,26 +143,25 @@ fn find_javac() -> Option<PathBuf> {
     }
 
     // Try PATH
-    if let Ok(output) = Command::new("which").arg("javac").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+    if let Ok(output) = Command::new("which").arg("javac").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
         }
     }
 
     // Try common locations on macOS
     let macos_java = Path::new("/usr/libexec/java_home");
-    if macos_java.exists() {
-        if let Ok(output) = Command::new(macos_java).output() {
-            if output.status.success() {
-                let java_home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let javac = PathBuf::from(java_home).join("bin").join("javac");
-                if javac.exists() {
-                    return Some(javac);
-                }
-            }
+    if macos_java.exists()
+        && let Ok(output) = Command::new(macos_java).output()
+        && output.status.success()
+    {
+        let java_home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let javac = PathBuf::from(java_home).join("bin").join("javac");
+        if javac.exists() {
+            return Some(javac);
         }
     }
 

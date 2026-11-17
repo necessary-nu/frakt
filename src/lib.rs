@@ -3,8 +3,8 @@
 //! This crate provides a unified async HTTP client that automatically selects
 //! the best backend for your platform. On Apple platforms, it uses NSURLSession
 //! for native performance and iOS background downloads. On other platforms,
-//! it uses reqwest with additional features like daemon processes for
-//! background downloads on Unix systems.
+//! it uses reqwest, with resumable background downloads that a helper process
+//! can carry on with after the program exits on Unix systems.
 //!
 //! # Features
 //!
@@ -12,7 +12,7 @@
 //! - **HTTP client**: Full-featured HTTP client with support for all standard methods
 //! - **File downloads**: Efficient streaming downloads directly to disk with progress tracking
 //! - **File uploads**: Support for uploading files or data with progress tracking
-//! - **Background downloads**: Platform-specific background downloads (NSURLSession on Apple, daemon processes on Unix)
+//! - **Background downloads**: Platform-specific background downloads (NSURLSession on Apple, resumable downloads with reqwest)
 //! - **WebSocket support**: Native WebSocket connections (NSURLSessionWebSocketTask on Apple, tokio-tungstenite elsewhere)
 //! - **Cookie management**: Automatic cookie handling with custom cookie jar support
 //! - **Authentication**: Built-in support for Bearer, Basic, and custom authentication
@@ -140,21 +140,33 @@
 //!
 //! ## Background Downloads
 //!
-//! Background downloads continue even when your app is suspended or terminated.
-//! The implementation varies by platform:
-//! - **Apple platforms**: Uses NSURLSession background downloads
-//! - **Unix systems**: Uses daemon processes for true background operation
-//! - **Other platforms**: Uses resumable downloads with retry logic
+//! Background downloads are made to outlast the code that started them. How
+//! far they do depends on the backend:
+//! - **Apple platforms**: Uses NSURLSession background downloads, which carry
+//!   on while the app is suspended or terminated
+//! - **reqwest**: Uses resumable downloads. The body is written to a partial
+//!   file next to the destination (`<name>.frakt-partial`, described by
+//!   `<name>.frakt-partial.meta`), and the destination is replaced in one
+//!   step once the download is complete. An interrupted download is carried
+//!   on by the next one for the same URL and destination, if the server still
+//!   has the same content.
+//!
+//! With reqwest the download runs in the task that awaits it. On Unix, a
+//! program that calls [`enable_background_helper`] at the top of `main` gets
+//! a detached helper process for each download instead, which keeps going
+//! after the program exits.
 //!
 //! ```rust,no_run
 //! use frakt::Client;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     frakt::enable_background_helper();
+//!
 //!     let client = Client::new()?;
 //!
 //!     let response = client
-//!         .download_background("https://example.com/large-video.mp4", "./downloads/video.mp4")
+//!         .download_background("https://example.com/large-video.mp4", "./downloads/video.mp4")?
 //!         .session_identifier("com.myapp.downloads")
 //!         .progress(|downloaded, total| {
 //!             if let Some(total) = total {
@@ -201,8 +213,9 @@
 //!
 //! - **Apple platforms** (macOS, iOS, tvOS, watchOS): Uses NSURLSession for native performance and iOS background downloads
 //! - **Other platforms**: Uses reqwest with platform-specific enhancements:
-//!   - **Unix systems**: Daemon processes for true background downloads
-//!   - **All platforms**: Resumable downloads with retry logic
+//!   - **All platforms**: Resumable background downloads with retry logic
+//!   - **Unix systems**: A detached helper process for background downloads,
+//!     once [`enable_background_helper`] has been called
 //!
 //! # Performance
 //!
@@ -216,7 +229,7 @@
 //! **Other platforms** use reqwest with additional features:
 //! - HTTP/2 support via reqwest
 //! - Connection pooling and keep-alive
-//! - Background downloads via daemon processes (Unix) or resumable downloads
+//! - Resumable background downloads, in a helper process on Unix if enabled
 //!
 //! Every backend asks for compressed bodies and decodes them, except for
 //! `Range` requests, which are sent with `Accept-Encoding: identity` unless
@@ -234,7 +247,7 @@ pub use auth::Auth;
 pub use backend::types::BodyIntegrity;
 pub use client::{
     BackendType, BackgroundDownloadBuilder, Client, ClientBuilder, DownloadBuilder,
-    DownloadResponse, UploadBuilder,
+    DownloadResponse, ProxyConfig, UploadBuilder,
 };
 pub use error::{Error, Result};
 pub use request::{Request, RequestBuilder};
@@ -242,9 +255,12 @@ pub use response::{BodyStats, Response, ResponseStream};
 
 // Re-export body types
 pub use body::Body;
+pub use body::FileBody;
 pub use body::MultipartPart;
 pub use cookies::{Cookie, CookieAcceptPolicy, CookieJar};
-pub use websocket::{CloseCode, Message, WebSocket, WebSocketBuilder};
+pub use websocket::{
+    CloseCode, DEFAULT_MAXIMUM_MESSAGE_SIZE, Message, WebSocket, WebSocketBuilder,
+};
 
 // Re-export http types for convenience
 pub use http;
@@ -260,10 +276,49 @@ mod body;
 mod client;
 mod cookies;
 mod error;
+mod redact;
 mod request;
 mod response;
 mod task;
 mod websocket;
+
+/// Let background downloads on the reqwest backend outlive this process.
+///
+/// Call it first thing in `main`:
+///
+/// ```no_run
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     frakt::enable_background_helper();
+///
+///     let client = frakt::Client::new()?;
+///     // ... the rest of the program
+///     Ok(())
+/// }
+/// ```
+///
+/// On Unix targets other than iOS, tvOS, watchOS, visionOS and Android,
+/// [`Client::download_background`] on the reqwest backend then runs each
+/// download in a helper process: this program's own executable, started
+/// again with the same arguments, with `FRAKT_BACKGROUND_HELPER=1` in its
+/// environment and the download described to it over a pipe. In a process
+/// started that way this function never returns. It closes the descriptors
+/// it inherited, runs the one download and exits, which is why the call
+/// belongs at the top of `main`: whatever came before it would be done again
+/// in every helper. The helper is in a session of its own, so it carries on
+/// when this process exits or its terminal closes.
+///
+/// Without this call, or where no helper can be started, the download runs
+/// in the task that awaits it and stops when that is dropped; the next
+/// download to the same destination resumes it.
+///
+/// On every other target and backend this does nothing, so it can be called
+/// unconditionally. It also does nothing in a set-uid or set-gid program,
+/// which must not take instructions from its environment.
+pub fn enable_background_helper() {
+    #[cfg(feature = "backend-reqwest")]
+    backend::reqwest::enable_background_helper();
+}
 
 #[cfg(all(target_os = "android", vampire))]
 pub use vampire::JNI_OnLoad;

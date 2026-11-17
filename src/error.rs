@@ -150,6 +150,17 @@ pub enum Error {
     #[error("WebSocket connection was closed")]
     WebSocketClosed,
 
+    /// A WebSocket message was larger than the connection's maximum
+    /// message size
+    /// ([`WebSocketBuilder::maximum_message_size`](crate::WebSocketBuilder::maximum_message_size)).
+    /// A message refused on the way out leaves the connection open; one
+    /// refused on the way in closes it.
+    #[error("WebSocket message exceeds the limit of {limit} bytes")]
+    WebSocketMessageTooLarge {
+        /// The connection's maximum message size.
+        limit: usize,
+    },
+
     /// UTF-8 conversion error.
     ///
     /// This error occurs when trying to convert response bytes to a UTF-8 string

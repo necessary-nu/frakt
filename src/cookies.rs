@@ -7,8 +7,10 @@ use crate::{
 
 /// Policy for cookie acceptance.
 ///
-/// This enum defines how cookies should be handled by the HTTP client.
-/// It maps directly to NSHTTPCookieAcceptPolicy values.
+/// This enum defines which cookies a jar stores from the responses of the
+/// clients that use it. It never affects cookies added with
+/// [`CookieJar::add_cookie`]. On the Foundation backend it is
+/// NSHTTPCookieAcceptPolicy.
 ///
 /// # Examples
 ///
@@ -39,8 +41,16 @@ pub enum CookieAcceptPolicy {
     Never,
     /// Accept cookies only from the main document domain.
     ///
-    /// Cookies will only be accepted if they come from the same domain as
-    /// the main document URL. This helps prevent third-party tracking cookies.
+    /// frakt has no documents, so the main document is the URL the request
+    /// was made to. A response's cookies are stored only if the response
+    /// came from that URL's host, or from a subdomain or parent domain of
+    /// it (`example.com` and `www.example.com` are one domain;
+    /// `a.example.com` and `b.example.com` are not, and neither are a
+    /// single-label host and its subdomains). In practice: cookies set by
+    /// another host that a redirect led to are dropped.
+    ///
+    /// On the Foundation backend the comparison is CFNetwork's own, against
+    /// the same main document.
     OnlyFromMainDocumentDomain,
 }
 
@@ -48,7 +58,12 @@ pub enum CookieAcceptPolicy {
 ///
 /// `CookieJar` provides a high-level interface for managing HTTP cookies. It uses
 /// the appropriate backend for the platform and provides methods for adding, removing, and querying cookies.
-/// Cookies are automatically sent with requests and stored from responses when enabled.
+/// A client that keeps cookies sends them from its jar and stores into it;
+/// clones of a jar share one store. Each cookie is stored for the origin
+/// whose response set it, redirects included, and sent only where it
+/// applies.
+///
+/// Its `Debug` output and [`Cookie`]'s leave cookie values out.
 ///
 /// # Examples
 ///
@@ -95,10 +110,54 @@ impl CookieJar {
         }
     }
 
+    /// The `cookie_store` behind this jar, for the backends that send and
+    /// store cookies themselves.
+    #[cfg_attr(
+        not(any(
+            feature = "backend-reqwest",
+            all(feature = "backend-winhttp", windows),
+            all(feature = "backend-android", target_os = "android")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn cookie_store(&self) -> Option<&crate::backend::CookieJar> {
+        match &self.storage {
+            CookieStorage::CookieStore(store) => Some(store),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(
+        not(any(
+            feature = "backend-reqwest",
+            all(feature = "backend-winhttp", windows),
+            all(feature = "backend-android", target_os = "android")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_cookie_store() -> Self {
+        Self {
+            storage: CookieStorage::CookieStore(crate::backend::CookieJar::new()),
+        }
+    }
+
+    #[cfg(all(feature = "backend-foundation", target_vendor = "apple"))]
+    pub(crate) fn with_foundation_storage(
+        storage: crate::backend::foundation::FoundationCookieStorage,
+    ) -> Self {
+        Self {
+            storage: CookieStorage::Foundation(storage),
+        }
+    }
+
     /// Create a new cookie jar with default storage.
     ///
-    /// This creates a cookie jar using the appropriate backend for the platform.
-    /// On Apple platforms, it uses NSHTTPCookieStorage. On other platforms, it uses reqwest cookie jar.
+    /// The jar's storage matches `backend`: NSHTTPCookieStorage (the shared
+    /// storage) for the Foundation backend, an in-memory RFC 6265 store for
+    /// the others. Pass it to [`ClientBuilder::cookie_jar`](crate::ClientBuilder::cookie_jar)
+    /// of a client using the same kind of backend; building a client with a
+    /// jar its backend cannot use fails.
     ///
     /// # Examples
     ///
@@ -148,7 +207,6 @@ impl CookieJar {
     /// Get all cookies stored in this jar.
     ///
     /// Returns a vector containing all cookies currently stored in the cookie jar.
-    /// Note: On some backends (like reqwest), this may return an empty vector due to API limitations.
     ///
     /// # Examples
     ///
@@ -235,8 +293,8 @@ impl CookieJar {
 
     /// Remove a cookie from the jar.
     ///
-    /// The cookie will no longer be stored or sent with requests.
-    /// Note: On some backends (like reqwest), this operation may not be supported due to API limitations.
+    /// The cookie will no longer be stored or sent with requests. It is
+    /// identified by its name, domain and path.
     ///
     /// # Arguments
     ///
@@ -267,7 +325,6 @@ impl CookieJar {
     ///
     /// This clears all stored cookies. Use with caution as this will affect
     /// all HTTP clients using the same cookie storage.
-    /// Note: On some backends (like reqwest), this operation may not be supported due to API limitations.
     ///
     /// # Examples
     ///
@@ -291,9 +348,9 @@ impl CookieJar {
 
     /// Set the cookie acceptance policy.
     ///
-    /// This controls how cookies are handled when received from servers.
-    /// The policy affects all HTTP clients using the same cookie storage.
-    /// Note: On some backends (like reqwest), this operation may not be supported due to API limitations.
+    /// This controls which cookies received from servers are stored; see
+    /// [`CookieAcceptPolicy`]. The policy affects all HTTP clients using
+    /// the same cookie storage, from their next response on.
     ///
     /// # Arguments
     ///
@@ -343,7 +400,7 @@ impl CookieJar {
 ///     .path("/settings")
 ///     .expires("Wed, 09 Jun 2024 10:18:14 GMT");
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Cookie {
     /// Cookie name
     pub name: String,
@@ -359,6 +416,21 @@ pub struct Cookie {
     pub http_only: bool,
     /// Expiration date as string (None for session cookies)
     pub expires: Option<String>,
+}
+
+/// A cookie's value is usually a session credential, so it is not shown.
+impl std::fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cookie")
+            .field("name", &self.name)
+            .field("value", &crate::redact::Redacted)
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .field("expires", &self.expires)
+            .finish()
+    }
 }
 
 impl Cookie {
